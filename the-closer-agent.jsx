@@ -1,8 +1,11 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useCallback } from "react";
 
 // ─── CONFIGURATION ──────────────────────────────────────────────────────────
 const MODEL = "claude-sonnet-4-20250514";
 const API_URL = "https://api.anthropic.com/v1/messages";
+const MAX_RETRIES = 2;
+const RETRY_DELAY_MS = 3000;
+const API_TIMEOUT_MS = 120000; // 2 minutes per step
 
 // ─── AGENT STEP DEFINITIONS ─────────────────────────────────────────────────
 const STEPS = [
@@ -30,6 +33,7 @@ CRITICAL RULES:
 1. Search for the EXACT address on Zillow, Redfin, HAR.com, and county tax records
 2. If you can't find a specific data point, estimate based on neighborhood averages and FLAG it as estimated
 3. Return ONLY valid JSON — no markdown, no backticks, no explanation
+4. All string values must use double quotes and escape any internal quotes with backslash
 
 Return this exact JSON structure:
 {
@@ -90,6 +94,7 @@ USE WEB SEARCH to find actual recent sales near this property. Search for:
 4. Specific addresses if known comps are provided
 
 CRITICAL: Search multiple times with different queries to find the best comps.
+All string values must use double quotes and escape any internal quotes with backslash.
 
 Return ONLY valid JSON:
 {
@@ -134,7 +139,7 @@ SUBJECT PROPERTY DATA:
 ${JSON.stringify(intel, null, 2)}
 
 COMP DATA FOR CONTEXT:
-${JSON.stringify(comps?.arvAnalysis, null, 2)}
+${JSON.stringify(comps?.arvAnalysis || {}, null, 2)}
 
 Assess the property across 9 building systems and evaluate Houston-specific risks.
 Use web search to check:
@@ -151,6 +156,8 @@ HOUSTON-SPECIFIC KNOWLEDGE:
 - Flat roofs + Houston heat = shorter roof life
 - Year-round AC demand = HVAC wears faster
 - Properties near Brays Bayou, Buffalo Bayou, White Oak Bayou, Greens Bayou = elevated flood risk regardless of FEMA zone
+
+All string values must use double quotes and escape any internal quotes with backslash.
 
 Return ONLY valid JSON:
 {
@@ -185,12 +192,12 @@ Return ONLY valid JSON:
 const PROMPT_REHAB = (intel, comps, condition, finishLevel) => `You are The Closer's Rehab Cost Estimation Agent for Houston, TX.
 
 PROPERTY DATA:
-${JSON.stringify(intel?.propertyDetails, null, 2)}
+${JSON.stringify(intel?.propertyDetails || {}, null, 2)}
 
-ARV TARGET: ${JSON.stringify(comps?.arvAnalysis, null, 2)}
+ARV TARGET: ${JSON.stringify(comps?.arvAnalysis || {}, null, 2)}
 
 CONDITION ASSESSMENT:
-${JSON.stringify(condition?.conditionAssessment, null, 2)}
+${JSON.stringify(condition?.conditionAssessment || {}, null, 2)}
 
 TARGET FINISH LEVEL: ${finishLevel || "Standard flip — match neighborhood expectations"}
 
@@ -211,6 +218,7 @@ HOUSTON CONTRACTOR PRICING (2024-2025 actual rates — DO NOT use national avera
 - Permits: $500-$2,500
 
 Generate three rehab scenarios based on condition assessment findings.
+All string values must use double quotes and escape any internal quotes with backslash.
 
 Return ONLY valid JSON:
 {
@@ -254,19 +262,19 @@ ASKING PRICE: $${askingPrice}
 FINANCING TERMS: ${financing || "Hard money at 12% APR, 90% LTC, 2 points origination"}
 
 ARV ANALYSIS:
-${JSON.stringify(comps?.arvAnalysis, null, 2)}
+${JSON.stringify(comps?.arvAnalysis || {}, null, 2)}
 
 MARKET CONTEXT:
-${JSON.stringify(comps?.marketContext, null, 2)}
+${JSON.stringify(comps?.marketContext || {}, null, 2)}
 
-CONDITION GRADE: ${condition?.conditionAssessment?.overallGrade}
-FLOOD RISK: ${condition?.floodRisk?.overallRisk}
-DEAL KILLERS: ${JSON.stringify(condition?.dealKillers)}
+CONDITION GRADE: ${condition?.conditionAssessment?.overallGrade || "Unknown"}
+FLOOD RISK: ${condition?.floodRisk?.overallRisk || "Unknown"}
+DEAL KILLERS: ${JSON.stringify(condition?.dealKillers || [])}
 
 REHAB ESTIMATES:
-Conservative: $${rehab?.scenarios?.conservative?.totalExpected}
-Expected: $${rehab?.scenarios?.expected?.totalExpected}
-Aggressive: $${rehab?.scenarios?.aggressive?.totalExpected}
+Conservative: $${rehab?.scenarios?.conservative?.totalExpected || "Unknown"}
+Expected: $${rehab?.scenarios?.expected?.totalExpected || "Unknown"}
+Aggressive: $${rehab?.scenarios?.aggressive?.totalExpected || "Unknown"}
 
 FINANCIAL MODEL RULES:
 - Hold period: 5 months
@@ -281,16 +289,53 @@ MODEL THREE SCENARIOS:
 2. Base case: Expected rehab + Expected ARV
 3. Worst case: Aggressive rehab + Low ARV
 
+IMPORTANT: The profitScenarios array MUST be ordered: [Best Case, Base Case, Worst Case] at indices 0, 1, 2.
+
 DEAL SCORE (1-100):
 - Profit potential: 40% weight (base case ROI > 30% = high, < 10% = low, negative = near zero)
 - Risk level: 30% weight (flood, comp confidence, condition severity, neighborhood)
 - Market conditions: 30% weight (DOM, inventory, demand, appreciation)
 
+VERDICT RULES (strictly follow these score thresholds):
+- BUY = dealScore 85-100 (only for high-conviction deals with strong margins and manageable risk)
+- NEGOTIATE = dealScore 45-84 (deal has potential but needs a better price or risk mitigation)
+- PASS = dealScore 0-44 (numbers don't work or risk is too high)
+
+All string values must use double quotes and escape any internal quotes with backslash.
+
 Return ONLY valid JSON:
 {
   "profitScenarios": [
     {
-      "name": "Best Case / Base Case / Worst Case",
+      "name": "Best Case",
+      "arvUsed": number,
+      "rehabCost": number,
+      "acquisitionCost": number,
+      "holdingCosts": number,
+      "buyClosing": number,
+      "sellClosing": number,
+      "totalInvested": number,
+      "grossProfit": number,
+      "netProfit": number,
+      "roi": number,
+      "margin": number
+    },
+    {
+      "name": "Base Case",
+      "arvUsed": number,
+      "rehabCost": number,
+      "acquisitionCost": number,
+      "holdingCosts": number,
+      "buyClosing": number,
+      "sellClosing": number,
+      "totalInvested": number,
+      "grossProfit": number,
+      "netProfit": number,
+      "roi": number,
+      "margin": number
+    },
+    {
+      "name": "Worst Case",
       "arvUsed": number,
       "rehabCost": number,
       "acquisitionCost": number,
@@ -313,10 +358,120 @@ Return ONLY valid JSON:
     "walkaway": number,
     "tactics": "string — specific negotiation advice for this deal"
   },
-  "closerTake": "string — 2-3 sentences of unfiltered dealmaker commentary. Be direct. If it's a dog, say it's a dog. If it's a gem, say why.",
+  "closerTake": "string — 2-3 sentences of unfiltered dealmaker commentary. Be direct. If it is a dog, say it is a dog. If it is a gem, say why.",
   "riskFactors": ["string"],
   "strengths": ["string"]
 }`;
+
+
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+
+/** Sanitize user-entered dollar amounts: strip $, commas, spaces → pure number string */
+function sanitizePrice(val) {
+  if (!val) return "0";
+  const cleaned = String(val).replace(/[$,\s]/g, "");
+  const num = parseFloat(cleaned);
+  return isNaN(num) ? "0" : String(Math.round(num));
+}
+
+/** Sleep helper for retry backoff */
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Extract and parse JSON from an API response string. Handles markdown fences, 
+ *  trailing commas, and malformed control characters without corrupting apostrophes. */
+function extractJSON(raw) {
+  // Strip markdown code fences
+  let cleaned = raw.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
+
+  // Find the outermost JSON object
+  // BUG FIX: Use brace-depth counting instead of greedy regex to avoid grabbing
+  // unrelated braces in surrounding text
+  let depth = 0;
+  let start = -1;
+  let end = -1;
+  for (let i = 0; i < cleaned.length; i++) {
+    const ch = cleaned[i];
+    if (ch === "{" && start === -1) {
+      start = i;
+      depth = 1;
+    } else if (ch === "{" && start !== -1) {
+      depth++;
+    } else if (ch === "}" && start !== -1) {
+      depth--;
+      if (depth === 0) {
+        end = i;
+        break;
+      }
+    }
+    // Skip over string literals to avoid counting braces inside strings
+    if (ch === '"' && start !== -1 && i > start) {
+      let j = i + 1;
+      while (j < cleaned.length && cleaned[j] !== '"') {
+        if (cleaned[j] === "\\") j++; // skip escaped characters
+        j++;
+      }
+      i = j; // advance past closing quote
+    }
+  }
+
+  if (start === -1 || end === -1) {
+    throw new Error("No JSON object found in API response");
+  }
+
+  const jsonStr = cleaned.substring(start, end + 1);
+
+  // First attempt: parse as-is
+  try {
+    return JSON.parse(jsonStr);
+  } catch (_) {
+    // Fall through to repair
+  }
+
+  // Repair pass — fix common LLM JSON mistakes WITHOUT corrupting string content
+  let repaired = jsonStr
+    // Fix trailing commas before } or ]
+    .replace(/,\s*}/g, "}")
+    .replace(/,\s*]/g, "]")
+    // Remove non-printable control chars EXCEPT valid whitespace (\n, \t, \r, space)
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+
+  // BUG FIX: Do NOT blindly replace single quotes with double quotes.
+  // The original code had: .replace(/'/g, '"')
+  // This corrupts strings like "There's a crack" → "There"s a crack" → invalid JSON.
+  // Instead, only replace single-quoted keys/values at JSON structural boundaries.
+
+  try {
+    return JSON.parse(repaired);
+  } catch (_) {
+    // Fall through to deeper repair
+  }
+
+  // Deeper repair: try to fix unescaped newlines inside string values
+  // Replace literal newlines inside JSON strings with \\n
+  let inString = false;
+  let result = "";
+  for (let i = 0; i < repaired.length; i++) {
+    const ch = repaired[i];
+    if (ch === '"' && (i === 0 || repaired[i - 1] !== "\\")) {
+      inString = !inString;
+      result += ch;
+    } else if (inString && ch === "\n") {
+      result += "\\n";
+    } else if (inString && ch === "\t") {
+      result += "\\t";
+    } else {
+      result += ch;
+    }
+  }
+
+  try {
+    return JSON.parse(result);
+  } catch (e) {
+    throw new Error(`JSON parse failed after repair: ${e.message}\nFirst 200 chars: ${result.substring(0, 200)}`);
+  }
+}
 
 
 // ─── API CALL HELPER ─────────────────────────────────────────────────────────
@@ -331,39 +486,57 @@ async function callAgent(systemPrompt, userMessage, useWebSearch = true) {
     body.tools = [{ type: "web_search_20250305", name: "web_search" }];
   }
 
-  const res = await fetch(API_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  let lastError = null;
 
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`API error ${res.status}: ${err}`);
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      // BUG FIX: Add timeout so a hung request doesn't spin forever
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+
+      const res = await fetch(API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!res.ok) {
+        const err = await res.text();
+        // Retry on 429 (rate limit) and 529 (overloaded)
+        if ((res.status === 429 || res.status === 529) && attempt < MAX_RETRIES) {
+          lastError = new Error(`API ${res.status} — retrying in ${RETRY_DELAY_MS / 1000}s...`);
+          await sleep(RETRY_DELAY_MS * (attempt + 1)); // linear backoff
+          continue;
+        }
+        throw new Error(`API error ${res.status}: ${err}`);
+      }
+
+      const data = await res.json();
+      const textBlocks = data.content?.filter((b) => b.type === "text") || [];
+      const raw = textBlocks.map((b) => b.text).join("\n");
+
+      if (!raw.trim()) {
+        throw new Error("API returned no text content — the model may have only performed tool use without generating a final answer.");
+      }
+
+      // BUG FIX: Use robust JSON extractor instead of greedy regex + broken repair
+      return extractJSON(raw);
+    } catch (err) {
+      lastError = err;
+      if (err.name === "AbortError") {
+        lastError = new Error(`API call timed out after ${API_TIMEOUT_MS / 1000}s`);
+      }
+      if (attempt < MAX_RETRIES) {
+        await sleep(RETRY_DELAY_MS * (attempt + 1));
+        continue;
+      }
+    }
   }
 
-  const data = await res.json();
-  const textBlocks = data.content?.filter((b) => b.type === "text") || [];
-  const raw = textBlocks.map((b) => b.text).join("\n");
-
-  // Parse JSON from response — handle markdown fences
-  const cleaned = raw.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
-
-  // Try to find JSON object in the response
-  const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) throw new Error("No JSON found in response");
-
-  try {
-    return JSON.parse(jsonMatch[0]);
-  } catch (e) {
-    // Attempt basic repairs
-    let repaired = jsonMatch[0]
-      .replace(/,\s*}/g, "}")
-      .replace(/,\s*]/g, "]")
-      .replace(/'/g, '"')
-      .replace(/[\x00-\x1F\x7F]/g, (c) => (c === "\n" || c === "\t" ? c : ""));
-    return JSON.parse(repaired);
-  }
+  throw lastError || new Error("API call failed after retries");
 }
 
 // ─── DESIGN TOKENS ──────────────────────────────────────────────────────────
@@ -544,7 +717,7 @@ const ScoreRing = ({ score, size = 140 }) => {
   const radius = (size - 16) / 2;
   const circumference = 2 * Math.PI * radius;
   const progress = (score / 100) * circumference;
-  const color = score >= 70 ? T.green : score >= 45 ? T.amber : T.red;
+  const color = score >= 85 ? T.green : score >= 45 ? T.amber : T.red;
   return (
     <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
       <circle
@@ -599,6 +772,15 @@ const pct = (n) => {
   return n.toFixed(1) + "%";
 };
 
+// ─── HELPER: find base-case profit scenario by name, with index fallback ────
+function findScenario(scenarios, nameFragment, fallbackIndex) {
+  if (!Array.isArray(scenarios) || scenarios.length === 0) return null;
+  const found = scenarios.find((s) =>
+    s.name?.toLowerCase().includes(nameFragment.toLowerCase())
+  );
+  return found || scenarios[fallbackIndex] || null;
+}
+
 // ─── MAIN APP ─────────────────────────────────────────────────────────────────
 export default function TheCloser() {
   const [view, setView] = useState("intake"); // intake | running | results
@@ -644,11 +826,24 @@ export default function TheCloser() {
     setError(null);
 
     const results = {};
+    // BUG FIX: sanitize asking price once — strip $, commas, whitespace
+    const cleanPrice = sanitizePrice(form.askingPrice);
 
     try {
       // STEP 1: Property Intel
       addLog(0, "Searching property records, tax data, and neighborhood context...");
-      const intelMsg = `Evaluate this property:\nAddress: ${form.address}\n${form.beds ? `Beds: ${form.beds}` : ""}\n${form.baths ? `Baths: ${form.baths}` : ""}\n${form.sqft ? `Sqft: ${form.sqft}` : ""}\n${form.yearBuilt ? `Year Built: ${form.yearBuilt}` : ""}\n${form.listingUrl ? `Listing: ${form.listingUrl}` : ""}\n${form.notes ? `Notes: ${form.notes}` : ""}`;
+      const intelMsg = [
+        `Evaluate this property:`,
+        `Address: ${form.address}`,
+        form.beds ? `Beds: ${form.beds}` : "",
+        form.baths ? `Baths: ${form.baths}` : "",
+        form.sqft ? `Sqft: ${form.sqft}` : "",
+        form.yearBuilt ? `Year Built: ${form.yearBuilt}` : "",
+        form.listingUrl ? `Listing: ${form.listingUrl}` : "",
+        form.notes ? `Notes: ${form.notes}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n");
       results.intel = await callAgent(PROMPT_INTEL, intelMsg, true);
       addLog(0, `✓ Found property data — confidence: ${results.intel?.dataConfidence || "unknown"}`);
       setStepResults((prev) => ({ ...prev, intel: results.intel }));
@@ -657,7 +852,7 @@ export default function TheCloser() {
       // STEP 2: Comp Analysis
       addLog(1, "Searching for comparable sales within 1 mile...");
       const compsPrompt = PROMPT_COMPS(results.intel, form.knownComps || null);
-      results.comps = await callAgent(compsPrompt, `Find comps for ${form.address}. Asking price: $${form.askingPrice}.`, true);
+      results.comps = await callAgent(compsPrompt, `Find comps for ${form.address}. Asking price: $${cleanPrice}.`, true);
       addLog(1, `✓ Found ${results.comps?.comps?.length || 0} comps — confidence: ${results.comps?.arvAnalysis?.compConfidence || "?"}/10`);
       setStepResults((prev) => ({ ...prev, comps: results.comps }));
       setCurrentStep(2);
@@ -673,15 +868,15 @@ export default function TheCloser() {
       // STEP 4: Rehab Estimation
       addLog(3, "Calculating rehab costs using Houston contractor pricing...");
       const rehabPrompt = PROMPT_REHAB(results.intel, results.comps, results.condition, form.finishLevel);
-      results.rehab = await callAgent(rehabPrompt, `Estimate rehab for ${form.address}. Max budget: ${form.maxRehab ? "$" + form.maxRehab : "no hard cap"}.`, false);
+      results.rehab = await callAgent(rehabPrompt, `Estimate rehab for ${form.address}. Max budget: ${form.maxRehab ? "$" + sanitizePrice(form.maxRehab) : "no hard cap"}.`, false);
       addLog(3, `✓ Expected rehab: ${fmt(results.rehab?.scenarios?.expected?.totalExpected)}`);
       setStepResults((prev) => ({ ...prev, rehab: results.rehab }));
       setCurrentStep(4);
 
       // STEP 5: Deal Scoring
       addLog(4, "Modeling profit scenarios and computing deal score...");
-      const finPrompt = PROMPT_FINANCIALS(results.intel, results.comps, results.condition, results.rehab, form.askingPrice, form.financing);
-      results.financials = await callAgent(finPrompt, `Score this deal. Asking: $${form.askingPrice}. ARV expected: $${results.comps?.arvAnalysis?.arvExpected}. Expected rehab: $${results.rehab?.scenarios?.expected?.totalExpected}.`, false);
+      const finPrompt = PROMPT_FINANCIALS(results.intel, results.comps, results.condition, results.rehab, cleanPrice, form.financing);
+      results.financials = await callAgent(finPrompt, `Score this deal. Asking: $${cleanPrice}. ARV expected: $${results.comps?.arvAnalysis?.arvExpected}. Expected rehab: $${results.rehab?.scenarios?.expected?.totalExpected}.`, false);
       addLog(4, `✓ Deal Score: ${results.financials?.dealScore} — ${results.financials?.verdict}`);
       setStepResults((prev) => ({ ...prev, financials: results.financials }));
 
@@ -689,10 +884,8 @@ export default function TheCloser() {
     } catch (err) {
       console.error(err);
       setError(err.message);
-      // If we have partial results, show them
-      if (Object.keys(results).length > 0) {
-        setStepResults(results);
-      }
+      // BUG FIX: Always sync partial results to state so they can be viewed
+      setStepResults((prev) => ({ ...prev, ...results }));
     }
   };
 
@@ -806,6 +999,9 @@ export default function TheCloser() {
 
   // ── RUNNING VIEW ────────────────────────────────────────────────────────
   if (view === "running") {
+    // BUG FIX: Determine if we have enough partial results to allow viewing
+    const hasPartialResults = Object.keys(stepResults).length > 0;
+
     return (
       <div style={{ minHeight: "100vh", background: T.bg, color: T.text, fontFamily: T.sans, padding: "24px" }}>
         <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
@@ -814,14 +1010,15 @@ export default function TheCloser() {
           <div style={{ textAlign: "center", marginBottom: 32 }}>
             <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 4 }}>Evaluating Deal</div>
             <div style={{ fontSize: 13, color: T.textMuted, fontFamily: T.mono }}>{form.address}</div>
-            <div style={{ fontSize: 13, color: T.green, fontFamily: T.mono }}>Asking: ${Number(form.askingPrice).toLocaleString()}</div>
+            <div style={{ fontSize: 13, color: T.green, fontFamily: T.mono }}>Asking: ${Number(sanitizePrice(form.askingPrice)).toLocaleString()}</div>
           </div>
 
           {/* Step progress */}
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
             {STEPS.map((step, i) => {
-              const isActive = i === currentStep;
+              const isActive = i === currentStep && !error;
               const isDone = i < currentStep || (view === "results");
+              const isFailed = i === currentStep && !!error;
               const isPending = i > currentStep;
               const logs = stepLogs[i] || [];
 
@@ -829,7 +1026,7 @@ export default function TheCloser() {
                 <Card
                   key={step.id}
                   style={{
-                    borderColor: isActive ? T.green + "60" : T.border,
+                    borderColor: isFailed ? T.red + "60" : isActive ? T.green + "60" : T.border,
                     opacity: isPending ? 0.4 : 1,
                     transition: "all 0.3s",
                   }}
@@ -837,14 +1034,14 @@ export default function TheCloser() {
                   <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
                     <div style={{
                       width: 32, height: 32, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14,
-                      background: isDone ? T.greenDim : isActive ? T.greenDim : "transparent",
-                      border: `1px solid ${isDone ? T.green : isActive ? T.green + "60" : T.border}`,
+                      background: isDone ? T.greenDim : isFailed ? T.redDim : isActive ? T.greenDim : "transparent",
+                      border: `1px solid ${isDone ? T.green : isFailed ? T.red : isActive ? T.green + "60" : T.border}`,
                       transition: "all 0.3s",
                     }}>
-                      {isDone ? "✓" : step.icon}
+                      {isDone ? "✓" : isFailed ? "✗" : step.icon}
                     </div>
                     <div style={{ flex: 1 }}>
-                      <div style={{ fontSize: 13, fontWeight: 600, color: isDone ? T.green : isActive ? T.text : T.textDim }}>
+                      <div style={{ fontSize: 13, fontWeight: 600, color: isDone ? T.green : isFailed ? T.red : isActive ? T.text : T.textDim }}>
                         {step.label}
                       </div>
                       <div style={{ fontSize: 11, color: T.textMuted, fontFamily: T.mono }}>
@@ -873,14 +1070,31 @@ export default function TheCloser() {
 
           {error && (
             <Card style={{ marginTop: 16, borderColor: T.red + "40" }}>
-              <div style={{ fontSize: 12, fontWeight: 600, color: T.red, fontFamily: T.mono, marginBottom: 8 }}>ERROR</div>
+              <div style={{ fontSize: 12, fontWeight: 600, color: T.red, fontFamily: T.mono, marginBottom: 8 }}>ERROR AT STEP {currentStep + 1}: {STEPS[currentStep]?.label?.toUpperCase()}</div>
               <div style={{ fontSize: 12, color: T.textMuted, fontFamily: T.mono, wordBreak: "break-all" }}>{error}</div>
-              <button
-                onClick={() => setView("intake")}
-                style={{ marginTop: 12, padding: "8px 16px", borderRadius: T.radius, border: `1px solid ${T.border}`, background: "transparent", color: T.text, fontSize: 12, fontFamily: T.mono, cursor: "pointer" }}
-              >
-                ← Back to Intake
-              </button>
+              <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+                <button
+                  onClick={() => setView("intake")}
+                  style={{ padding: "8px 16px", borderRadius: T.radius, border: `1px solid ${T.border}`, background: "transparent", color: T.text, fontSize: 12, fontFamily: T.mono, cursor: "pointer" }}
+                >
+                  ← Back to Intake
+                </button>
+                {/* BUG FIX: Allow viewing partial results when pipeline errors mid-run */}
+                {hasPartialResults && (
+                  <button
+                    onClick={() => setView("results")}
+                    style={{ padding: "8px 16px", borderRadius: T.radius, border: `1px solid ${T.amber}40`, background: T.amberDim, color: T.amber, fontSize: 12, fontFamily: T.mono, cursor: "pointer" }}
+                  >
+                    View Partial Results ({Object.keys(stepResults).length}/{STEPS.length} steps)
+                  </button>
+                )}
+                <button
+                  onClick={runPipeline}
+                  style={{ padding: "8px 16px", borderRadius: T.radius, border: `1px solid ${T.green}40`, background: T.greenDim, color: T.green, fontSize: 12, fontFamily: T.mono, cursor: "pointer" }}
+                >
+                  Retry ↻
+                </button>
+              </div>
             </Card>
           )}
         </div>
@@ -896,6 +1110,9 @@ export default function TheCloser() {
   const verdict = financials?.verdict || "—";
   const verdictColor = verdict === "BUY" ? "green" : verdict === "NEGOTIATE" ? "amber" : "red";
 
+  // BUG FIX: Find base case scenario by name instead of hardcoded index
+  const baseCase = findScenario(financials?.profitScenarios, "base", 1);
+
   const TABS = [
     { id: "summary", label: "Summary" },
     { id: "comps", label: "Comps" },
@@ -905,328 +1122,404 @@ export default function TheCloser() {
     { id: "profit", label: "Profit" },
   ];
 
-  const renderSummary = () => (
-    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-      {/* Score + Verdict */}
-      <Card>
-        <div style={{ display: "flex", alignItems: "center", gap: 24, flexWrap: "wrap" }}>
-          <ScoreRing score={score} />
-          <div style={{ flex: 1, minWidth: 200 }}>
-            <Badge color={verdictColor}>{verdict}</Badge>
-            <div style={{ fontSize: 14, color: T.text, marginTop: 10, lineHeight: 1.6 }}>
-              {financials?.verdictReason || "—"}
-            </div>
-            <div style={{ fontSize: 13, color: T.textMuted, marginTop: 12, lineHeight: 1.6, fontStyle: "italic", borderLeft: `2px solid ${T.green}40`, paddingLeft: 12 }}>
-              "{financials?.closerTake || "—"}"
+  // Determine which tabs have data (for partial results)
+  const tabHasData = {
+    summary: !!financials,
+    comps: !!comps,
+    condition: !!condition,
+    risk: !!condition?.floodRisk,
+    rehab: !!rehab,
+    profit: !!financials?.profitScenarios,
+  };
+
+  const renderSummary = () => {
+    if (!financials) {
+      return (
+        <Card>
+          <div style={{ textAlign: "center", color: T.textMuted, fontFamily: T.mono, fontSize: 13, padding: 20 }}>
+            Deal scoring did not complete. Switch to a completed tab to see partial data.
+          </div>
+        </Card>
+      );
+    }
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+        {/* Score + Verdict */}
+        <Card>
+          <div style={{ display: "flex", alignItems: "center", gap: 24, flexWrap: "wrap" }}>
+            <ScoreRing score={score} />
+            <div style={{ flex: 1, minWidth: 200 }}>
+              <Badge color={verdictColor}>{verdict}</Badge>
+              <div style={{ fontSize: 14, color: T.text, marginTop: 10, lineHeight: 1.6 }}>
+                {financials?.verdictReason || "—"}
+              </div>
+              <div style={{ fontSize: 13, color: T.textMuted, marginTop: 12, lineHeight: 1.6, fontStyle: "italic", borderLeft: `2px solid ${T.green}40`, paddingLeft: 12 }}>
+                {financials?.closerTake || "—"}
+              </div>
             </div>
           </div>
+        </Card>
+
+        {/* Key Metrics Row */}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 12 }}>
+          {[
+            { label: "ASKING", value: fmt(Number(sanitizePrice(form.askingPrice))), color: T.text },
+            { label: "ARV (EXPECTED)", value: fmt(comps?.arvAnalysis?.arvExpected), color: T.blue },
+            { label: "COMP CONFIDENCE", value: `${comps?.arvAnalysis?.compConfidence || "?"}/10`, color: (comps?.arvAnalysis?.compConfidence || 0) >= 7 ? T.green : T.amber },
+            { label: "CONDITION", value: condition?.conditionAssessment?.overallGrade || "?", color: T.text },
+            { label: "FLOOD RISK", value: condition?.floodRisk?.overallRisk || "?", color: condition?.floodRisk?.overallRisk === "LOW" ? T.green : condition?.floodRisk?.overallRisk === "MODERATE" ? T.amber : T.red },
+            { label: "BASE ROI", value: pct(baseCase?.roi), color: (baseCase?.roi || 0) > 20 ? T.green : T.amber },
+          ].map((m) => (
+            <Card key={m.label} style={{ padding: 14, textAlign: "center" }}>
+              <div style={{ fontSize: 10, color: T.textMuted, fontFamily: T.mono, letterSpacing: "0.5px", marginBottom: 6 }}>{m.label}</div>
+              <div style={{ fontSize: 20, fontWeight: 700, color: m.color, fontFamily: T.mono }}>{m.value}</div>
+            </Card>
+          ))}
         </div>
-      </Card>
 
-      {/* Key Metrics Row */}
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 12 }}>
-        {[
-          { label: "ASKING", value: fmt(Number(form.askingPrice)), color: T.text },
-          { label: "ARV (EXPECTED)", value: fmt(comps?.arvAnalysis?.arvExpected), color: T.blue },
-          { label: "COMP CONFIDENCE", value: `${comps?.arvAnalysis?.compConfidence || "?"}/10`, color: (comps?.arvAnalysis?.compConfidence || 0) >= 7 ? T.green : T.amber },
-          { label: "CONDITION", value: condition?.conditionAssessment?.overallGrade || "?", color: T.text },
-          { label: "FLOOD RISK", value: condition?.floodRisk?.overallRisk || "?", color: condition?.floodRisk?.overallRisk === "LOW" ? T.green : condition?.floodRisk?.overallRisk === "MODERATE" ? T.amber : T.red },
-          { label: "BASE ROI", value: pct(financials?.profitScenarios?.[1]?.roi), color: (financials?.profitScenarios?.[1]?.roi || 0) > 20 ? T.green : T.amber },
-        ].map((m) => (
-          <Card key={m.label} style={{ padding: 14, textAlign: "center" }}>
-            <div style={{ fontSize: 10, color: T.textMuted, fontFamily: T.mono, letterSpacing: "0.5px", marginBottom: 6 }}>{m.label}</div>
-            <div style={{ fontSize: 20, fontWeight: 700, color: m.color, fontFamily: T.mono }}>{m.value}</div>
+        {/* Negotiation */}
+        {financials?.negotiation && (
+          <Card>
+            <div style={{ fontSize: 12, fontWeight: 600, color: T.green, fontFamily: T.mono, letterSpacing: "0.5px", marginBottom: 12 }}>NEGOTIATION STRATEGY</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
+              {[
+                { label: "Opening Offer", value: fmt(financials.negotiation.openingOffer) },
+                { label: "Max Offer", value: fmt(financials.negotiation.maxOffer) },
+                { label: "Walk Away", value: fmt(financials.negotiation.walkaway) },
+              ].map((n) => (
+                <div key={n.label} style={{ textAlign: "center" }}>
+                  <div style={{ fontSize: 10, color: T.textMuted, fontFamily: T.mono, marginBottom: 4 }}>{n.label}</div>
+                  <div style={{ fontSize: 18, fontWeight: 700, fontFamily: T.mono, color: T.text }}>{n.value}</div>
+                </div>
+              ))}
+            </div>
+            {financials.negotiation.tactics && (
+              <div style={{ fontSize: 12, color: T.textMuted, marginTop: 12, lineHeight: 1.6, paddingTop: 12, borderTop: `1px solid ${T.border}` }}>
+                {financials.negotiation.tactics}
+              </div>
+            )}
           </Card>
-        ))}
-      </div>
+        )}
 
-      {/* Negotiation */}
-      {financials?.negotiation && (
-        <Card>
-          <div style={{ fontSize: 12, fontWeight: 600, color: T.green, fontFamily: T.mono, letterSpacing: "0.5px", marginBottom: 12 }}>NEGOTIATION STRATEGY</div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
-            {[
-              { label: "Opening Offer", value: fmt(financials.negotiation.openingOffer) },
-              { label: "Max Offer", value: fmt(financials.negotiation.maxOffer) },
-              { label: "Walk Away", value: fmt(financials.negotiation.walkaway) },
-            ].map((n) => (
-              <div key={n.label} style={{ textAlign: "center" }}>
-                <div style={{ fontSize: 10, color: T.textMuted, fontFamily: T.mono, marginBottom: 4 }}>{n.label}</div>
-                <div style={{ fontSize: 18, fontWeight: 700, fontFamily: T.mono, color: T.text }}>{n.value}</div>
+        {/* Strengths & Risks */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+          <Card>
+            <div style={{ fontSize: 12, fontWeight: 600, color: T.green, fontFamily: T.mono, marginBottom: 10 }}>STRENGTHS</div>
+            {(financials?.strengths || []).map((s, i) => (
+              <div key={i} style={{ fontSize: 12, color: T.textMuted, marginTop: 6, lineHeight: 1.5 }}>
+                <span style={{ color: T.green, marginRight: 6 }}>+</span>{s}
               </div>
             ))}
-          </div>
-          {financials.negotiation.tactics && (
-            <div style={{ fontSize: 12, color: T.textMuted, marginTop: 12, lineHeight: 1.6, paddingTop: 12, borderTop: `1px solid ${T.border}` }}>
-              {financials.negotiation.tactics}
-            </div>
-          )}
-        </Card>
-      )}
-
-      {/* Strengths & Risks */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-        <Card>
-          <div style={{ fontSize: 12, fontWeight: 600, color: T.green, fontFamily: T.mono, marginBottom: 10 }}>STRENGTHS</div>
-          {(financials?.strengths || []).map((s, i) => (
-            <div key={i} style={{ fontSize: 12, color: T.textMuted, marginTop: 6, lineHeight: 1.5 }}>
-              <span style={{ color: T.green, marginRight: 6 }}>+</span>{s}
-            </div>
-          ))}
-        </Card>
-        <Card>
-          <div style={{ fontSize: 12, fontWeight: 600, color: T.red, fontFamily: T.mono, marginBottom: 10 }}>RISK FACTORS</div>
-          {(financials?.riskFactors || []).map((r, i) => (
-            <div key={i} style={{ fontSize: 12, color: T.textMuted, marginTop: 6, lineHeight: 1.5 }}>
-              <span style={{ color: T.red, marginRight: 6 }}>!</span>{r}
-            </div>
-          ))}
-        </Card>
+          </Card>
+          <Card>
+            <div style={{ fontSize: 12, fontWeight: 600, color: T.red, fontFamily: T.mono, marginBottom: 10 }}>RISK FACTORS</div>
+            {(financials?.riskFactors || []).map((r, i) => (
+              <div key={i} style={{ fontSize: 12, color: T.textMuted, marginTop: 6, lineHeight: 1.5 }}>
+                <span style={{ color: T.red, marginRight: 6 }}>!</span>{r}
+              </div>
+            ))}
+          </Card>
+        </div>
       </div>
-    </div>
-  );
+    );
+  };
 
-  const renderComps = () => (
-    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-      {/* ARV Summary */}
-      <Card>
-        <div style={{ fontSize: 12, fontWeight: 600, color: T.blue, fontFamily: T.mono, marginBottom: 12 }}>ARV RANGE</div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 12 }}>
-          {[
-            { label: "LOW", value: fmt(comps?.arvAnalysis?.arvLow) },
-            { label: "EXPECTED", value: fmt(comps?.arvAnalysis?.arvExpected) },
-            { label: "HIGH", value: fmt(comps?.arvAnalysis?.arvHigh) },
-            { label: "$/SQFT", value: comps?.arvAnalysis?.medianPricePerSqft ? `$${Math.round(comps.arvAnalysis.medianPricePerSqft)}` : "—" },
-          ].map((m) => (
-            <div key={m.label} style={{ textAlign: "center" }}>
-              <div style={{ fontSize: 10, color: T.textMuted, fontFamily: T.mono, marginBottom: 4 }}>{m.label}</div>
-              <div style={{ fontSize: 18, fontWeight: 700, fontFamily: T.mono, color: T.text }}>{m.value}</div>
-            </div>
-          ))}
-        </div>
-      </Card>
-
-      {/* Comp Table */}
-      <Card style={{ padding: 0, overflow: "hidden" }}>
-        <div style={{ padding: "16px 20px", borderBottom: `1px solid ${T.border}` }}>
-          <div style={{ fontSize: 12, fontWeight: 600, color: T.blue, fontFamily: T.mono }}>COMPARABLE SALES ({(comps?.comps || []).length})</div>
-        </div>
-        <div style={{ overflowX: "auto" }}>
-          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, fontFamily: T.mono }}>
-            <thead>
-              <tr style={{ borderBottom: `1px solid ${T.border}` }}>
-                {["Address", "Price", "$/sf", "Bed/Ba", "Sqft", "Condition", "Dist", "Score"].map((h) => (
-                  <th key={h} style={{ padding: "10px 12px", textAlign: "left", color: T.textMuted, fontWeight: 600, fontSize: 10, letterSpacing: "0.5px" }}>{h}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {(comps?.comps || []).map((c, i) => (
-                <tr key={i} style={{ borderBottom: `1px solid ${T.border}` }}>
-                  <td style={{ padding: "10px 12px", color: T.text, maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.address}</td>
-                  <td style={{ padding: "10px 12px", color: T.green }}>{fmt(c.salePrice)}</td>
-                  <td style={{ padding: "10px 12px", color: T.textMuted }}>${Math.round(c.pricePerSqft || 0)}</td>
-                  <td style={{ padding: "10px 12px", color: T.textMuted }}>{c.beds}/{c.baths}</td>
-                  <td style={{ padding: "10px 12px", color: T.textMuted }}>{c.sqft?.toLocaleString()}</td>
-                  <td style={{ padding: "10px 12px" }}>
-                    <Badge color={c.condition === "renovated" ? "green" : c.condition === "updated" ? "blue" : c.condition === "distressed" ? "red" : "amber"}>
-                      {c.condition}
-                    </Badge>
-                  </td>
-                  <td style={{ padding: "10px 12px", color: T.textMuted }}>{c.distanceMiles}mi</td>
-                  <td style={{ padding: "10px 12px", color: (c.relevanceScore || 0) >= 7 ? T.green : T.amber }}>{c.relevanceScore}/10</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </Card>
-
-      {/* Market Context */}
-      {comps?.marketContext && (
+  const renderComps = () => {
+    if (!comps) {
+      return (
         <Card>
-          <div style={{ fontSize: 12, fontWeight: 600, color: T.blue, fontFamily: T.mono, marginBottom: 10 }}>MARKET CONTEXT</div>
+          <div style={{ textAlign: "center", color: T.textMuted, fontFamily: T.mono, fontSize: 13, padding: 20 }}>
+            Comp analysis did not complete.
+          </div>
+        </Card>
+      );
+    }
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+        {/* ARV Summary */}
+        <Card>
+          <div style={{ fontSize: 12, fontWeight: 600, color: T.blue, fontFamily: T.mono, marginBottom: 12 }}>ARV RANGE</div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 12 }}>
             {[
-              { label: "INVENTORY", value: comps.marketContext.inventoryLevel },
-              { label: "AVG DOM", value: comps.marketContext.avgDaysOnMarket ? `${comps.marketContext.avgDaysOnMarket}d` : "—" },
-              { label: "PRICE TREND", value: comps.marketContext.priceDirection },
-              { label: "BUYER DEMAND", value: comps.marketContext.buyerDemand },
+              { label: "LOW", value: fmt(comps?.arvAnalysis?.arvLow) },
+              { label: "EXPECTED", value: fmt(comps?.arvAnalysis?.arvExpected) },
+              { label: "HIGH", value: fmt(comps?.arvAnalysis?.arvHigh) },
+              { label: "$/SQFT", value: comps?.arvAnalysis?.medianPricePerSqft ? `$${Math.round(comps.arvAnalysis.medianPricePerSqft)}` : "—" },
             ].map((m) => (
               <div key={m.label} style={{ textAlign: "center" }}>
                 <div style={{ fontSize: 10, color: T.textMuted, fontFamily: T.mono, marginBottom: 4 }}>{m.label}</div>
-                <div style={{ fontSize: 13, fontWeight: 600, fontFamily: T.mono, color: T.text, textTransform: "capitalize" }}>{m.value}</div>
+                <div style={{ fontSize: 18, fontWeight: 700, fontFamily: T.mono, color: T.text }}>{m.value}</div>
               </div>
             ))}
           </div>
         </Card>
-      )}
-    </div>
-  );
 
-  const renderCondition = () => (
-    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-      <Card>
-        <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 16 }}>
-          <div style={{ fontSize: 42, fontWeight: 700, fontFamily: T.mono, color: T.text }}>
-            {condition?.conditionAssessment?.overallGrade || "?"}
+        {/* Comp Table */}
+        <Card style={{ padding: 0, overflow: "hidden" }}>
+          <div style={{ padding: "16px 20px", borderBottom: `1px solid ${T.border}` }}>
+            <div style={{ fontSize: 12, fontWeight: 600, color: T.blue, fontFamily: T.mono }}>COMPARABLE SALES ({(comps?.comps || []).length})</div>
           </div>
-          <div>
-            <Badge color={
-              condition?.conditionAssessment?.overallGrade === "A" || condition?.conditionAssessment?.overallGrade === "B" ? "green" :
-              condition?.conditionAssessment?.overallGrade === "C" ? "amber" : "red"
-            }>
-              {condition?.conditionAssessment?.classification || "Unknown"}
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, fontFamily: T.mono }}>
+              <thead>
+                <tr style={{ borderBottom: `1px solid ${T.border}` }}>
+                  {["Address", "Price", "$/sf", "Bed/Ba", "Sqft", "Condition", "Dist", "Score"].map((h) => (
+                    <th key={h} style={{ padding: "10px 12px", textAlign: "left", color: T.textMuted, fontWeight: 600, fontSize: 10, letterSpacing: "0.5px" }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {(comps?.comps || []).map((c, i) => (
+                  <tr key={i} style={{ borderBottom: `1px solid ${T.border}` }}>
+                    <td style={{ padding: "10px 12px", color: T.text, maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.address}</td>
+                    <td style={{ padding: "10px 12px", color: T.green }}>{fmt(c.salePrice)}</td>
+                    <td style={{ padding: "10px 12px", color: T.textMuted }}>${Math.round(c.pricePerSqft || 0)}</td>
+                    <td style={{ padding: "10px 12px", color: T.textMuted }}>{c.beds}/{c.baths}</td>
+                    <td style={{ padding: "10px 12px", color: T.textMuted }}>{c.sqft?.toLocaleString()}</td>
+                    <td style={{ padding: "10px 12px" }}>
+                      <Badge color={c.condition === "renovated" ? "green" : c.condition === "updated" ? "blue" : c.condition === "distressed" ? "red" : "amber"}>
+                        {c.condition}
+                      </Badge>
+                    </td>
+                    <td style={{ padding: "10px 12px", color: T.textMuted }}>{c.distanceMiles}mi</td>
+                    <td style={{ padding: "10px 12px", color: (c.relevanceScore || 0) >= 7 ? T.green : T.amber }}>{c.relevanceScore}/10</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+
+        {/* Market Context */}
+        {comps?.marketContext && (
+          <Card>
+            <div style={{ fontSize: 12, fontWeight: 600, color: T.blue, fontFamily: T.mono, marginBottom: 10 }}>MARKET CONTEXT</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 12 }}>
+              {[
+                { label: "INVENTORY", value: comps.marketContext.inventoryLevel },
+                { label: "AVG DOM", value: comps.marketContext.avgDaysOnMarket ? `${comps.marketContext.avgDaysOnMarket}d` : "—" },
+                { label: "PRICE TREND", value: comps.marketContext.priceDirection },
+                { label: "BUYER DEMAND", value: comps.marketContext.buyerDemand },
+              ].map((m) => (
+                <div key={m.label} style={{ textAlign: "center" }}>
+                  <div style={{ fontSize: 10, color: T.textMuted, fontFamily: T.mono, marginBottom: 4 }}>{m.label}</div>
+                  <div style={{ fontSize: 13, fontWeight: 600, fontFamily: T.mono, color: T.text, textTransform: "capitalize" }}>{m.value}</div>
+                </div>
+              ))}
+            </div>
+          </Card>
+        )}
+      </div>
+    );
+  };
+
+  const renderCondition = () => {
+    if (!condition) {
+      return (
+        <Card>
+          <div style={{ textAlign: "center", color: T.textMuted, fontFamily: T.mono, fontSize: 13, padding: 20 }}>
+            Condition assessment did not complete.
+          </div>
+        </Card>
+      );
+    }
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+        <Card>
+          <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 16 }}>
+            <div style={{ fontSize: 42, fontWeight: 700, fontFamily: T.mono, color: T.text }}>
+              {condition?.conditionAssessment?.overallGrade || "?"}
+            </div>
+            <div>
+              <Badge color={
+                condition?.conditionAssessment?.overallGrade === "A" || condition?.conditionAssessment?.overallGrade === "B" ? "green" :
+                condition?.conditionAssessment?.overallGrade === "C" ? "amber" : "red"
+              }>
+                {condition?.conditionAssessment?.classification || "Unknown"}
+              </Badge>
+            </div>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {(condition?.conditionAssessment?.systems || []).map((sys, i) => (
+              <div key={i} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", background: T.bg, borderRadius: T.radius }}>
+                <StatusDot status={sys.status} />
+                <div style={{ width: 90, fontSize: 12, fontWeight: 600, fontFamily: T.mono, color: T.text }}>{sys.name}</div>
+                <Badge color={sys.status === "Good" ? "green" : sys.status === "Fair" ? "amber" : "red"}>{sys.status}</Badge>
+                <div style={{ flex: 1, fontSize: 11, color: T.textMuted, marginLeft: 8 }}>{sys.notes}</div>
+                {sys.houstonFlag && (
+                  <div style={{ fontSize: 10, color: T.amber, fontFamily: T.mono }}>⚠ {sys.houstonFlag}</div>
+                )}
+              </div>
+            ))}
+          </div>
+        </Card>
+        {(condition?.dealKillers || []).length > 0 && (
+          <Card style={{ borderColor: T.red + "40" }}>
+            <div style={{ fontSize: 12, fontWeight: 600, color: T.red, fontFamily: T.mono, marginBottom: 10 }}>⚠ DEAL KILLERS</div>
+            {condition.dealKillers.map((dk, i) => (
+              <div key={i} style={{ fontSize: 12, color: T.text, marginTop: 6, lineHeight: 1.5 }}>• {dk}</div>
+            ))}
+          </Card>
+        )}
+      </div>
+    );
+  };
+
+  const renderRisk = () => {
+    if (!condition?.floodRisk) {
+      return (
+        <Card>
+          <div style={{ textAlign: "center", color: T.textMuted, fontFamily: T.mono, fontSize: 13, padding: 20 }}>
+            Risk assessment did not complete.
+          </div>
+        </Card>
+      );
+    }
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+        <Card>
+          <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 16 }}>
+            <div style={{ fontSize: 14, fontWeight: 700, fontFamily: T.mono, color: T.text }}>FLOOD RISK:</div>
+            <Badge color={condition?.floodRisk?.overallRisk === "LOW" ? "green" : condition?.floodRisk?.overallRisk === "MODERATE" ? "amber" : "red"}>
+              {condition?.floodRisk?.overallRisk || "UNKNOWN"}
             </Badge>
           </div>
-        </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {(condition?.conditionAssessment?.systems || []).map((sys, i) => (
-            <div key={i} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", background: T.bg, borderRadius: T.radius }}>
-              <StatusDot status={sys.status} />
-              <div style={{ width: 90, fontSize: 12, fontWeight: 600, fontFamily: T.mono, color: T.text }}>{sys.name}</div>
-              <Badge color={sys.status === "Good" ? "green" : sys.status === "Fair" ? "amber" : "red"}>{sys.status}</Badge>
-              <div style={{ flex: 1, fontSize: 11, color: T.textMuted, marginLeft: 8 }}>{sys.notes}</div>
-              {sys.houstonFlag && (
-                <div style={{ fontSize: 10, color: T.amber, fontFamily: T.mono }}>⚠ {sys.houstonFlag}</div>
-              )}
-            </div>
-          ))}
-        </div>
-      </Card>
-      {(condition?.dealKillers || []).length > 0 && (
-        <Card style={{ borderColor: T.red + "40" }}>
-          <div style={{ fontSize: 12, fontWeight: 600, color: T.red, fontFamily: T.mono, marginBottom: 10 }}>⚠ DEAL KILLERS</div>
-          {condition.dealKillers.map((dk, i) => (
-            <div key={i} style={{ fontSize: 12, color: T.text, marginTop: 6, lineHeight: 1.5 }}>• {dk}</div>
-          ))}
-        </Card>
-      )}
-    </div>
-  );
-
-  const renderRisk = () => (
-    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-      <Card>
-        <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 16 }}>
-          <div style={{ fontSize: 14, fontWeight: 700, fontFamily: T.mono, color: T.text }}>FLOOD RISK:</div>
-          <Badge color={condition?.floodRisk?.overallRisk === "LOW" ? "green" : condition?.floodRisk?.overallRisk === "MODERATE" ? "amber" : "red"}>
-            {condition?.floodRisk?.overallRisk || "UNKNOWN"}
-          </Badge>
-        </div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 16 }}>
-          {[
-            { label: "FEMA ZONE", value: condition?.floodRisk?.femaZone || "—" },
-            { label: "HARVEY IMPACT", value: condition?.floodRisk?.harveyImpact || "—" },
-            { label: "FLOOD INS. EST.", value: condition?.floodRisk?.insuranceEstimate ? fmt(condition.floodRisk.insuranceEstimate) + "/yr" : "—" },
-          ].map((m) => (
-            <div key={m.label} style={{ textAlign: "center", padding: 12, background: T.bg, borderRadius: T.radius }}>
-              <div style={{ fontSize: 10, color: T.textMuted, fontFamily: T.mono, marginBottom: 4 }}>{m.label}</div>
-              <div style={{ fontSize: 14, fontWeight: 600, fontFamily: T.mono, color: T.text, textTransform: "capitalize" }}>{m.value}</div>
-            </div>
-          ))}
-        </div>
-        {(condition?.floodRisk?.factors || []).map((f, i) => (
-          <div key={i} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", background: T.bg, borderRadius: T.radius, marginTop: 8 }}>
-            <Badge color={f.risk === "LOW" ? "green" : f.risk === "MODERATE" ? "amber" : "red"}>{f.risk}</Badge>
-            <div style={{ flex: 1 }}>
-              <div style={{ fontSize: 12, fontWeight: 600, color: T.text }}>{f.factor}</div>
-              <div style={{ fontSize: 11, color: T.textMuted }}>{f.details}</div>
-            </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 16 }}>
+            {[
+              { label: "FEMA ZONE", value: condition?.floodRisk?.femaZone || "—" },
+              { label: "HARVEY IMPACT", value: condition?.floodRisk?.harveyImpact || "—" },
+              { label: "FLOOD INS. EST.", value: condition?.floodRisk?.insuranceEstimate ? fmt(condition.floodRisk.insuranceEstimate) + "/yr" : "—" },
+            ].map((m) => (
+              <div key={m.label} style={{ textAlign: "center", padding: 12, background: T.bg, borderRadius: T.radius }}>
+                <div style={{ fontSize: 10, color: T.textMuted, fontFamily: T.mono, marginBottom: 4 }}>{m.label}</div>
+                <div style={{ fontSize: 14, fontWeight: 600, fontFamily: T.mono, color: T.text, textTransform: "capitalize" }}>{m.value}</div>
+              </div>
+            ))}
           </div>
-        ))}
-      </Card>
-    </div>
-  );
-
-  const renderRehab = () => (
-    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-      {["conservative", "expected", "aggressive"].map((tier) => {
-        const s = rehab?.scenarios?.[tier];
-        if (!s) return null;
-        const tierColor = tier === "conservative" ? T.green : tier === "expected" ? T.amber : T.red;
-        return (
-          <Card key={tier}>
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
-              <div>
-                <Badge color={tier === "conservative" ? "green" : tier === "expected" ? "amber" : "red"}>
-                  {s.label || tier}
-                </Badge>
-                <div style={{ fontSize: 11, color: T.textMuted, marginTop: 6 }}>{s.scope}</div>
-              </div>
-              <div style={{ textAlign: "right" }}>
-                <div style={{ fontSize: 22, fontWeight: 700, fontFamily: T.mono, color: tierColor }}>{fmt(s.totalExpected)}</div>
-                <div style={{ fontSize: 10, color: T.textMuted, fontFamily: T.mono }}>{s.timelineWeeks} weeks</div>
+          {(condition?.floodRisk?.factors || []).map((f, i) => (
+            <div key={i} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", background: T.bg, borderRadius: T.radius, marginTop: 8 }}>
+              <Badge color={f.risk === "LOW" ? "green" : f.risk === "MODERATE" ? "amber" : "red"}>{f.risk}</Badge>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, color: T.text }}>{f.factor}</div>
+                <div style={{ fontSize: 11, color: T.textMuted }}>{f.details}</div>
               </div>
             </div>
-            <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 12 }}>
-              {(s.lineItems || []).map((item, i) => (
-                <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", borderBottom: i < s.lineItems.length - 1 ? `1px solid ${T.border}` : "none" }}>
-                  <div style={{ fontSize: 12, color: T.text }}>{item.item}</div>
-                  <div style={{ fontSize: 12, fontFamily: T.mono, color: T.textMuted }}>{fmt(item.expected)}</div>
-                </div>
-              ))}
-            </div>
-          </Card>
-        );
-      })}
-      {(rehab?.criticalItems || []).length > 0 && (
-        <Card style={{ borderColor: T.amber + "40" }}>
-          <div style={{ fontSize: 12, fontWeight: 600, color: T.amber, fontFamily: T.mono, marginBottom: 8 }}>CRITICAL — MUST ADDRESS</div>
-          {rehab.criticalItems.map((c, i) => (
-            <div key={i} style={{ fontSize: 12, color: T.text, marginTop: 6 }}>• {c}</div>
           ))}
         </Card>
-      )}
-    </div>
-  );
+      </div>
+    );
+  };
 
-  const renderProfit = () => (
-    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-      {(financials?.profitScenarios || []).map((s, i) => {
-        const profitable = (s.netProfit || 0) > 0;
-        return (
-          <Card key={i} style={{ borderColor: profitable ? T.green + "20" : T.red + "20" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-              <Badge color={i === 0 ? "green" : i === 1 ? "amber" : "red"}>{s.name}</Badge>
-              <div style={{ fontSize: 22, fontWeight: 700, fontFamily: T.mono, color: profitable ? T.green : T.red }}>
-                {fmt(s.netProfit)}
+  const renderRehab = () => {
+    if (!rehab) {
+      return (
+        <Card>
+          <div style={{ textAlign: "center", color: T.textMuted, fontFamily: T.mono, fontSize: 13, padding: 20 }}>
+            Rehab estimation did not complete.
+          </div>
+        </Card>
+      );
+    }
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+        {["conservative", "expected", "aggressive"].map((tier) => {
+          const s = rehab?.scenarios?.[tier];
+          if (!s) return null;
+          const tierColor = tier === "conservative" ? T.green : tier === "expected" ? T.amber : T.red;
+          return (
+            <Card key={tier}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+                <div>
+                  <Badge color={tier === "conservative" ? "green" : tier === "expected" ? "amber" : "red"}>
+                    {s.label || tier}
+                  </Badge>
+                  <div style={{ fontSize: 11, color: T.textMuted, marginTop: 6 }}>{s.scope}</div>
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontSize: 22, fontWeight: 700, fontFamily: T.mono, color: tierColor }}>{fmt(s.totalExpected)}</div>
+                  <div style={{ fontSize: 10, color: T.textMuted, fontFamily: T.mono }}>{s.timelineWeeks} weeks</div>
+                </div>
               </div>
-            </div>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 8, fontSize: 11, fontFamily: T.mono }}>
-              {[
-                { label: "ARV", value: fmt(s.arvUsed) },
-                { label: "ALL-IN", value: fmt(s.totalInvested) },
-                { label: "ROI", value: pct(s.roi) },
-                { label: "MARGIN", value: pct(s.margin) },
-              ].map((m) => (
-                <div key={m.label} style={{ textAlign: "center", padding: 8, background: T.bg, borderRadius: T.radius }}>
-                  <div style={{ color: T.textMuted, fontSize: 9, marginBottom: 3 }}>{m.label}</div>
-                  <div style={{ color: T.text, fontWeight: 600 }}>{m.value}</div>
-                </div>
-              ))}
-            </div>
-            {/* Cost breakdown */}
-            <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${T.border}`, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, fontSize: 11 }}>
-              {[
-                { label: "Acquisition", value: fmt(s.acquisitionCost) },
-                { label: "Rehab", value: fmt(s.rehabCost) },
-                { label: "Holding (5mo)", value: fmt(s.holdingCosts) },
-                { label: "Buy Closing", value: fmt(s.buyClosing) },
-                { label: "Sell Closing", value: fmt(s.sellClosing) },
-                { label: "Gross Profit", value: fmt(s.grossProfit) },
-              ].map((m) => (
-                <div key={m.label} style={{ display: "flex", justifyContent: "space-between", color: T.textMuted, fontFamily: T.mono }}>
-                  <span>{m.label}</span>
-                  <span style={{ color: T.text }}>{m.value}</span>
-                </div>
-              ))}
-            </div>
+              <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 12 }}>
+                {(s.lineItems || []).map((item, i) => (
+                  <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", borderBottom: i < s.lineItems.length - 1 ? `1px solid ${T.border}` : "none" }}>
+                    <div style={{ fontSize: 12, color: T.text }}>{item.item}</div>
+                    <div style={{ fontSize: 12, fontFamily: T.mono, color: T.textMuted }}>{fmt(item.expected)}</div>
+                  </div>
+                ))}
+              </div>
+            </Card>
+          );
+        })}
+        {(rehab?.criticalItems || []).length > 0 && (
+          <Card style={{ borderColor: T.amber + "40" }}>
+            <div style={{ fontSize: 12, fontWeight: 600, color: T.amber, fontFamily: T.mono, marginBottom: 8 }}>CRITICAL — MUST ADDRESS</div>
+            {rehab.criticalItems.map((c, i) => (
+              <div key={i} style={{ fontSize: 12, color: T.text, marginTop: 6 }}>• {c}</div>
+            ))}
           </Card>
-        );
-      })}
-    </div>
-  );
+        )}
+      </div>
+    );
+  };
+
+  const renderProfit = () => {
+    if (!financials?.profitScenarios) {
+      return (
+        <Card>
+          <div style={{ textAlign: "center", color: T.textMuted, fontFamily: T.mono, fontSize: 13, padding: 20 }}>
+            Profit modeling did not complete.
+          </div>
+        </Card>
+      );
+    }
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+        {(financials?.profitScenarios || []).map((s, i) => {
+          const profitable = (s.netProfit || 0) > 0;
+          return (
+            <Card key={i} style={{ borderColor: profitable ? T.green + "20" : T.red + "20" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+                <Badge color={i === 0 ? "green" : i === 1 ? "amber" : "red"}>{s.name}</Badge>
+                <div style={{ fontSize: 22, fontWeight: 700, fontFamily: T.mono, color: profitable ? T.green : T.red }}>
+                  {fmt(s.netProfit)}
+                </div>
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 8, fontSize: 11, fontFamily: T.mono }}>
+                {[
+                  { label: "ARV", value: fmt(s.arvUsed) },
+                  { label: "ALL-IN", value: fmt(s.totalInvested) },
+                  { label: "ROI", value: pct(s.roi) },
+                  { label: "MARGIN", value: pct(s.margin) },
+                ].map((m) => (
+                  <div key={m.label} style={{ textAlign: "center", padding: 8, background: T.bg, borderRadius: T.radius }}>
+                    <div style={{ color: T.textMuted, fontSize: 9, marginBottom: 3 }}>{m.label}</div>
+                    <div style={{ color: T.text, fontWeight: 600 }}>{m.value}</div>
+                  </div>
+                ))}
+              </div>
+              {/* Cost breakdown */}
+              <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${T.border}`, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, fontSize: 11 }}>
+                {[
+                  { label: "Acquisition", value: fmt(s.acquisitionCost) },
+                  { label: "Rehab", value: fmt(s.rehabCost) },
+                  { label: "Holding (5mo)", value: fmt(s.holdingCosts) },
+                  { label: "Buy Closing", value: fmt(s.buyClosing) },
+                  { label: "Sell Closing", value: fmt(s.sellClosing) },
+                  { label: "Gross Profit", value: fmt(s.grossProfit) },
+                ].map((m) => (
+                  <div key={m.label} style={{ display: "flex", justifyContent: "space-between", color: T.textMuted, fontFamily: T.mono }}>
+                    <span>{m.label}</span>
+                    <span style={{ color: T.text }}>{m.value}</span>
+                  </div>
+                ))}
+              </div>
+            </Card>
+          );
+        })}
+      </div>
+    );
+  };
 
   const tabContent = {
     summary: renderSummary,
@@ -1247,7 +1540,7 @@ export default function TheCloser() {
           <div>
             <div style={{ fontSize: 14, fontWeight: 700 }}>{form.address}</div>
             <div style={{ fontSize: 11, color: T.textMuted, fontFamily: T.mono, marginTop: 2 }}>
-              Evaluated {new Date().toLocaleDateString()} · Asking {fmt(Number(form.askingPrice))}
+              Evaluated {new Date().toLocaleDateString()} · Asking {fmt(Number(sanitizePrice(form.askingPrice)))}
             </div>
           </div>
           <button
@@ -1267,6 +1560,15 @@ export default function TheCloser() {
           </button>
         </div>
 
+        {/* Partial results warning banner */}
+        {error && (
+          <Card style={{ marginBottom: 16, borderColor: T.amber + "40", padding: "12px 16px" }}>
+            <div style={{ fontSize: 11, fontFamily: T.mono, color: T.amber }}>
+              ⚠ PARTIAL RESULTS — Pipeline errored at Step {currentStep + 1} ({STEPS[currentStep]?.label}). Data below is from completed steps only.
+            </div>
+          </Card>
+        )}
+
         {/* Tabs */}
         <div style={{
           display: "flex",
@@ -1277,28 +1579,32 @@ export default function TheCloser() {
           padding: 3,
           border: `1px solid ${T.border}`,
         }}>
-          {TABS.map((tab) => (
-            <button
-              key={tab.id}
-              onClick={() => setActiveTab(tab.id)}
-              style={{
-                flex: 1,
-                padding: "10px 8px",
-                borderRadius: 6,
-                border: "none",
-                background: activeTab === tab.id ? T.surfaceHover : "transparent",
-                color: activeTab === tab.id ? T.text : T.textMuted,
-                fontSize: 12,
-                fontWeight: 600,
-                fontFamily: T.mono,
-                cursor: "pointer",
-                transition: "all 0.2s",
-                letterSpacing: "0.3px",
-              }}
-            >
-              {tab.label}
-            </button>
-          ))}
+          {TABS.map((tab) => {
+            const hasData = tabHasData[tab.id];
+            return (
+              <button
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id)}
+                style={{
+                  flex: 1,
+                  padding: "10px 8px",
+                  borderRadius: 6,
+                  border: "none",
+                  background: activeTab === tab.id ? T.surfaceHover : "transparent",
+                  color: activeTab === tab.id ? T.text : hasData ? T.textMuted : T.textDim,
+                  fontSize: 12,
+                  fontWeight: 600,
+                  fontFamily: T.mono,
+                  cursor: "pointer",
+                  transition: "all 0.2s",
+                  letterSpacing: "0.3px",
+                  opacity: hasData ? 1 : 0.4,
+                }}
+              >
+                {tab.label}
+              </button>
+            );
+          })}
         </div>
 
         {/* Tab Content */}
