@@ -1,0 +1,1315 @@
+import { useState, useCallback, useRef } from "react";
+
+// ─── CONFIGURATION ──────────────────────────────────────────────────────────
+const MODEL = "claude-sonnet-4-20250514";
+const API_URL = "https://api.anthropic.com/v1/messages";
+
+// ─── AGENT STEP DEFINITIONS ─────────────────────────────────────────────────
+const STEPS = [
+  { id: "intel", label: "Property Intel", icon: "🔍", desc: "Gathering property data, tax records, and neighborhood context" },
+  { id: "comps", label: "Comp Analysis", icon: "📊", desc: "Finding and analyzing comparable sales" },
+  { id: "condition", label: "Condition & Risk", icon: "🏚️", desc: "Assessing property condition via photos, flood zone, and environmental risk" },
+  { id: "rehab", label: "Rehab & Costs", icon: "🔧", desc: "Estimating rehab scope and costs using photos + Houston pricing engine" },
+  { id: "financials", label: "Deal Scoring", icon: "💰", desc: "Modeling profit scenarios and computing final deal score" },
+];
+
+// ─── SYSTEM PROMPTS ──────────────────────────────────────────────────────────
+
+const PROMPT_INTEL = `You are The Closer's Property Intelligence Agent. Your ONLY job is to research a property and return structured data.
+
+Given a property address and any provided details, use web search aggressively to find:
+- Full property details (sqft, beds, baths, year built, lot size, stories)
+- Current tax appraisal value and tax history
+- Ownership history and current listing status
+- Neighborhood context (median home price, school ratings, crime trends, development)
+- Days on market if currently listed
+- Any prior sales history with prices and dates
+- Zoning information
+
+CRITICAL RULES:
+1. Search for the EXACT address on Zillow, Redfin, HAR.com, and county tax records
+2. If you can't find a specific data point, estimate based on neighborhood averages and FLAG it as estimated
+3. Return ONLY valid JSON — no markdown, no backticks, no explanation
+
+Return this exact JSON structure:
+{
+  "address": "full address",
+  "propertyDetails": {
+    "sqft": number or null,
+    "sqftSource": "verified" or "estimated",
+    "beds": number or null,
+    "baths": number or null,
+    "yearBuilt": number or null,
+    "lotSizeSqft": number or null,
+    "stories": number or null,
+    "propertyType": "string",
+    "garage": "string or null"
+  },
+  "taxData": {
+    "appraisalValue": number or null,
+    "annualTaxes": number or null,
+    "taxYear": number or null
+  },
+  "ownershipHistory": [{"date": "string", "price": number or null, "event": "string"}],
+  "listingStatus": "active/pending/sold/off-market/unknown",
+  "daysOnMarket": number or null,
+  "neighborhood": {
+    "medianHomePrice": number or null,
+    "medianPricePerSqft": number or null,
+    "schoolRating": "string or null",
+    "crimeLevel": "low/moderate/high/unknown",
+    "trendDirection": "appreciating/stable/declining/unknown",
+    "notableContext": "string"
+  },
+  "dataConfidence": "high/medium/low",
+  "searchNotes": "string"
+}`;
+
+const PROMPT_COMPS = (intel, knownComps) => `You are The Closer's Comparable Sales Analyst. Your job is to find and analyze comparable sales to establish ARV.
+
+SUBJECT PROPERTY DATA:
+${JSON.stringify(intel, null, 2)}
+
+${knownComps ? `USER-PROVIDED KNOWN COMPS (treat as verified):\n${knownComps}` : "No known comps provided."}
+
+COMP SELECTION RULES:
+- SOLD properties within 1 mile (0.5mi in dense areas)
+- Sold within last 6 months (extend to 9 if thin)
+- Same bed/bath ±1, sqft ±20%
+- Prioritize RENOVATED comps for ARV, AS-IS comps for acquisition validation
+- Target 5-8 comps, minimum 3
+- Search Zillow, Redfin, HAR.com, Realtor.com
+
+USE WEB SEARCH aggressively. Search multiple times with different queries.
+
+Return ONLY valid JSON:
+{
+  "comps": [
+    {
+      "address": "string",
+      "salePrice": number,
+      "saleDate": "string",
+      "sqft": number,
+      "pricePerSqft": number,
+      "beds": number,
+      "baths": number,
+      "yearBuilt": number or null,
+      "condition": "renovated/updated/average/dated/distressed",
+      "distanceMiles": number,
+      "source": "string",
+      "relevanceScore": 1-10,
+      "notes": "string"
+    }
+  ],
+  "arvAnalysis": {
+    "arvLow": number,
+    "arvExpected": number,
+    "arvHigh": number,
+    "medianPricePerSqft": number,
+    "renovatedPricePerSqft": number,
+    "compConfidence": 1-10,
+    "confidenceReason": "string"
+  },
+  "marketContext": {
+    "inventoryLevel": "low/moderate/high",
+    "avgDaysOnMarket": number or null,
+    "priceDirection": "rising/stable/falling",
+    "buyerDemand": "strong/moderate/weak"
+  },
+  "searchNotes": "string"
+}`;
+
+const PROMPT_CONDITION = (intel, comps, hasPhotos) => `You are The Closer's Property Condition & Risk Assessment Agent.
+
+SUBJECT PROPERTY DATA:
+${JSON.stringify(intel, null, 2)}
+
+COMP DATA:
+${JSON.stringify(comps?.arvAnalysis, null, 2)}
+
+${hasPhotos ? `PHOTO ANALYSIS INSTRUCTIONS:
+You have been provided property photos. Act as if you are PHYSICALLY WALKING this property. Examine each photo carefully and assess:
+
+EXTERIOR PHOTOS — Look for:
+- Roof condition: missing/curling shingles, sagging ridgeline, debris, moss, visible age, material type
+- Foundation: visible cracks in brick/slab, separation from walls, uneven settling, moisture stains at base
+- Siding: condition, material (vinyl/Hardie/brick/wood), paint peeling, rot, damage
+- Windows: age, style (single/double pane), condition of frames, any broken seals (fogging)
+- Front door/garage door: condition, style, age
+- Driveway: cracks, settling, staining
+- Landscaping: overgrown vs maintained, drainage grading direction
+- Overall curb appeal: first impression rating
+
+INTERIOR PHOTOS — Look for:
+- Flooring: type (carpet/tile/LVP/hardwood), condition, age, staining, wear patterns
+- Walls/ceilings: crack patterns (especially diagonal = structural), water stains, drywall condition, paint quality
+- Kitchen: cabinet style/age/condition, countertop material, appliance age, backsplash, lighting
+- Bathrooms: vanity age, tile condition, fixtures age/style, signs of moisture damage, caulk condition
+- Doors/trim: alignment (misaligned = foundation movement), condition, style/age
+- Electrical: visible panel type, outlet style (2-prong vs 3-prong), light fixtures age
+- HVAC: visible unit age (check labels/model in photos), ductwork condition
+- Plumbing: visible pipe material, water heater condition, fixture age
+- Signs of water damage: stains on ceiling/walls, warped baseboards, mold
+- General finish level: rate from 1-10 where 1=original/distressed, 10=recently renovated
+
+For EACH photo, note what you observe. Be SPECIFIC — "kitchen cabinets appear to be original 1980s oak with visible wear" not just "kitchen is dated."
+
+IMPORTANT: If photos contradict the property age or listing description, trust the photos.
+` : `NO PHOTOS PROVIDED — Condition assessment is based on property age, listing text, and neighborhood data only. 
+Flag this as LOWER CONFIDENCE. Recommend photos for more accurate assessment.`}
+
+Assess 9 building systems and evaluate Houston-specific risks.
+Use web search to check:
+1. FEMA flood zone for this exact address
+2. Harvey flood damage records
+3. Harris County Flood Control District data
+4. Bayou proximity
+5. Houston soil zone (Beaumont clay)
+
+HOUSTON-SPECIFIC KNOWLEDGE:
+- Expansive Beaumont clay = high foundation risk
+- Galvanized/polybutylene pipes pre-1990 = repipe likely
+- Federal Pacific/Zinsco panels = replacement mandatory
+- Flat roofs + Houston heat = shorter life
+- Year-round AC = faster HVAC wear
+- Near Brays/Buffalo/White Oak/Greens Bayou = elevated flood risk regardless of FEMA
+
+Return ONLY valid JSON:
+{
+  "conditionAssessment": {
+    "overallGrade": "A/B/C/D/F",
+    "classification": "Renovated/Dated-but-functional/Cosmetic-rehab/Heavy-rehab/Gut-job",
+    "photoAnalysis": ${hasPhotos ? `{
+      "photosReviewed": number,
+      "overallImpressions": "string — first impression summary of property condition from photos",
+      "keyFindings": ["string — specific observations from photos that affect valuation or rehab scope"],
+      "photoVsAge": "consistent/better-than-expected/worse-than-expected — does the property look its age?"
+    }` : `null`},
+    "confidenceLevel": "${hasPhotos ? 'high — photo-verified' : 'medium — no photos, age-based estimate'}",
+    "systems": [
+      {
+        "name": "Roof/Foundation/HVAC/Plumbing/Electrical/Interior/Exterior/Kitchen/Bathrooms",
+        "status": "Good/Fair/Poor/Critical",
+        "notes": "string",
+        "estimatedAge": "string or null",
+        "photoEvidence": "string or null — what was visible in photos for this system",
+        "houstonFlag": "string or null"
+      }
+    ]
+  },
+  "floodRisk": {
+    "overallRisk": "LOW/MODERATE/HIGH/CRITICAL",
+    "femaZone": "string",
+    "harveyImpact": "none/minor/moderate/severe/unknown",
+    "bayouProximity": "string",
+    "drainageRisk": "string",
+    "insuranceEstimate": number or null,
+    "factors": [
+      {"factor": "string", "risk": "LOW/MODERATE/HIGH", "details": "string"}
+    ]
+  },
+  "dealKillers": ["string"],
+  "searchNotes": "string"
+}`;
+
+// ─── PROMPT_REHAB v2 — Houston Pricing Engine ────────────────────────────────
+const PROMPT_REHAB = (intel, comps, condition, finishLevel, hasPhotos) => {
+  const sqft = intel?.propertyDetails?.sqft || null;
+  const yearBuilt = intel?.propertyDetails?.yearBuilt || null;
+  const beds = intel?.propertyDetails?.beds || null;
+  const baths = intel?.propertyDetails?.baths || null;
+  const neighborhood = intel?.neighborhood?.notableContext || "";
+
+  const systems = condition?.conditionAssessment?.systems || [];
+  const autoScope = systems
+    .filter(s => s.status === "Poor" || s.status === "Critical")
+    .map(s => `- ${s.name}: ${s.status} → MUST include in all scenarios. ${s.notes || ""} ${s.houstonFlag || ""} ${s.photoEvidence ? `[PHOTO: ${s.photoEvidence}]` : ""}`)
+    .join("\n");
+  const fairSystems = systems
+    .filter(s => s.status === "Fair")
+    .map(s => `- ${s.name}: Fair → Include in Expected+Aggressive. ${s.notes || ""} ${s.photoEvidence ? `[PHOTO: ${s.photoEvidence}]` : ""}`)
+    .join("\n");
+
+  const floodRisk = condition?.floodRisk?.overallRisk || "UNKNOWN";
+  const condGrade = condition?.conditionAssessment?.overallGrade || "?";
+  const classification = condition?.conditionAssessment?.classification || "unknown";
+  const photoFindings = condition?.conditionAssessment?.photoAnalysis?.keyFindings || [];
+
+  return `You are The Closer's Rehab Cost Estimation Agent — Houston flip specialist.
+
+SUBJECT PROPERTY
+Square footage: ${sqft || "UNKNOWN — estimate from comps"}
+Year built: ${yearBuilt || "UNKNOWN"}
+Beds/Baths: ${beds || "?"}/${baths || "?"}
+Condition grade: ${condGrade} (${classification})
+Flood risk: ${floodRisk}
+Neighborhood: ${neighborhood}
+
+ARV TARGET: ${JSON.stringify(comps?.arvAnalysis, null, 2)}
+TARGET FINISH LEVEL: ${finishLevel || "standard"}
+
+${hasPhotos ? `PHOTO-BASED FINDINGS FROM CONDITION ASSESSMENT:
+${photoFindings.map(f => `• ${f}`).join("\n")}
+
+You also have the property photos. Use them to REFINE your rehab estimates:
+- If you can see the kitchen, assess cabinet/counter/appliance condition directly
+- If you can see bathrooms, assess fixtures/tile/vanity condition directly
+- If you can see flooring, assess type and condition directly
+- If exterior is visible, assess paint/siding/roof condition directly
+- Photo evidence should OVERRIDE age-based assumptions when they conflict
+` : "No photos available — estimates based on age and condition assessment text only."}
+
+CONDITION-DRIVEN SCOPE RULES (AUTO-GENERATED — follow STRICTLY):
+
+MANDATORY — ALL scenarios (Poor/Critical):
+${autoScope || "None flagged"}
+
+INCLUDE IN EXPECTED + AGGRESSIVE (Fair):
+${fairSystems || "None flagged"}
+
+HOUSTON CONTRACTOR PRICING ENGINE (2025-2026 MARKET DATA)
+*** All prices Houston-specific. Scale per-sqft items to ACTUAL property sqft. Show math. ***
+
+A. FOUNDATION (slab-on-grade / Beaumont clay)
+- Concrete pressed piers: $235–$650/pier | Steel: $1,000–$1,500/pier
+- Pier count: <1,200sf=6-12, 1,200-1,800sf=10-18, 1,800-2,500sf=15-25, 2,500+sf=20-30
+- Minor (6-10 piers): $2,500–$5,000 | Moderate (10-18): $4,500–$10,000 | Major (20+): $10,000–$18,000
+- Add: plumbing test $150-$300, drainage $2,500-$5,500
+
+B. ROOF (Houston heat/UV + hurricane)
+- Asphalt shingles: $4.00–$6.50/sf roof area (roof ≈ sqft × 1.15)
+- 1,000-1,400sf: $6K-$10K | 1,400-2,000sf: $8K-$14K | 2,000-2,800sf: $12K-$20K
+- Metal: add $5K-$8K | Impact-resistant: add $0.75-$1.50/sf
+
+C. HVAC (8-10 months AC runtime)
+- Full system: 14 SEER $5,500-$7,500 | 16 SEER $7,500-$10,000
+- AC-only: $3,500-$5,500 (14) | $5,000-$7,500 (16)
+- Ductwork repair: $500-$1,500 | Full replacement: $2,500-$5,500
+
+D. PLUMBING / RE-PIPE (PEX)
+- 1-bath: $3,500-$5,500 | 2-bath: $4,500-$7,000 | 3-bath: $6,000-$8,500
+- Water heater: tank $800-$1,800 | tankless $2,500-$4,500
+
+E. ELECTRICAL
+- Panel 100A→200A: $2,000-$4,000 | FPE/Zinsco: $2,500-$4,500
+- Partial rewire: $2,000-$5,000 | Full: $8,000-$16,000
+
+F. INTERIOR PAINT — SCALE BY SQFT
+- Rental: $1.80-$2.50/sf | Standard: $2.50-$3.50/sf | Premium: $3.50-$5.00/sf
+
+G. FLOORING — SCALE BY SQFT (area ≈ sqft × 0.85)
+- Rental LVP: $3.50-$5.00/sf | Standard LVP/SPC: $5.00-$7.00/sf | Premium: $7.00-$10.00/sf
+
+H. KITCHEN — BY TIER
+- Rental ($8K-$14K): reface cabs, laminate, basic appliances
+- Standard ($14K-$25K): new Shaker cabs, quartz, mid-range SS, tile backsplash
+- Premium ($25K-$40K): semi-custom cabs, premium quartz, premium appliances
+
+I. BATHROOM — PER BATH, BY TIER
+- Rental ($3,500-$6K) | Standard ($6K-$12K) | Premium ($12K-$20K master only)
+- MULTIPLY: baths × per-bath. Master=full tier, secondary=one tier down.
+
+J. EXTERIOR
+- Ext paint: $3K-$7K | Front door: $500-$2K | Garage door: $1,200-$3,500
+- Driveway repair: $1,500-$4,500 | Landscaping: $1,500-$4,000
+
+K. MISC
+- Dumpster: $450-$650/pull | Cleanup: $800-$2K | Permits: $500-$2,500
+
+SUBMARKET MULTIPLIER:
+- Inner Loop: 1.10-1.15x | Spring Branch: 1.05-1.10x | Katy/Sugar Land/Pearland: 1.00x
+- Acres Homes/Sunnyside: 0.90-0.95x | Alief/Sharpstown: 0.85-0.95x | Cypress/Tomball: 1.00-1.05x
+
+CONTINGENCY: Cosmetic: 5-8% | Standard: 10-12% | Heavy/gut: 15-20% | +5% if flood MODERATE+ | +5% if pre-1960
+
+FINISH LEVEL: ${finishLevel === "rental" ? "Rental grade." : finishLevel === "premium" ? "Premium flip." : "Standard flip."}
+
+SHOW MATH: "Interior paint: 1500sf x $3.00/sf = $4,500"
+
+CRITICAL JSON RULES:
+- Use "x" not "×" in calculations
+- Keep calculation strings SHORT (under 60 chars)
+- NO newlines inside string values
+- NO unescaped quotes inside strings — use single quotes if needed
+- Ensure every { has a matching } and every [ has a matching ]
+- Double-check JSON validity before responding
+
+Return ONLY valid JSON:
+{
+  "scenarios": {
+    "conservative": {
+      "label": "string", "scope": "string",
+      "totalLow": number, "totalHigh": number, "totalExpected": number,
+      "lineItems": [{"item":"string","category":"cosmetic/structural/mechanical/exterior","low":number,"high":number,"expected":number,"calculation":"string","mandatory":true/false,"rationale":"string"}],
+      "contingencyPercent": number, "contingencyAmount": number, "subtotalBeforeContingency": number, "timelineWeeks": number
+    },
+    "expected": { "...same..." },
+    "aggressive": { "...same..." }
+  },
+  "scopeRules": {
+    "mandatoryItems": ["string"], "conditionDrivenItems": ["string"],
+    "submarketMultiplier": number, "submarketNote": "string",
+    "photoImpact": "${hasPhotos ? 'string — how photos changed estimates vs age-only' : 'null — no photos'}"
+  },
+  "criticalItems": ["string"],
+  "budgetWarnings": ["string"],
+  "notes": "string"
+}`;
+};
+
+const PROMPT_FINANCIALS = (intel, comps, condition, rehab, askingPrice, financing) => `You are The Closer's Deal Scoring & Financial Analysis Agent.
+
+ASKING PRICE: $${askingPrice}
+FINANCING: ${financing || "Hard money at 12% APR, 90% LTC, 2 points origination"}
+
+ARV: ${JSON.stringify(comps?.arvAnalysis, null, 2)}
+MARKET: ${JSON.stringify(comps?.marketContext, null, 2)}
+CONDITION: ${condition?.conditionAssessment?.overallGrade} (confidence: ${condition?.conditionAssessment?.confidenceLevel || "unknown"})
+FLOOD: ${condition?.floodRisk?.overallRisk}
+DEAL KILLERS: ${JSON.stringify(condition?.dealKillers)}
+
+REHAB:
+Conservative: $${rehab?.scenarios?.conservative?.totalExpected}
+Expected: $${rehab?.scenarios?.expected?.totalExpected}
+Aggressive: $${rehab?.scenarios?.aggressive?.totalExpected}
+
+MODEL: Hold 5mo | Holding $2,500-4,000/mo | Buy closing 2-3% | Sell closing 6-8% | Min ROI 15% | Target 25-30%
+
+THREE SCENARIOS:
+1. Best: Conservative rehab + Expected ARV
+2. Base: Expected rehab + Expected ARV
+3. Worst: Aggressive rehab + Low ARV
+
+DEAL SCORE (1-100): Profit 40% + Risk 30% + Market 30%
+
+Return ONLY valid JSON:
+{
+  "profitScenarios": [
+    {
+      "name": "Best Case / Base Case / Worst Case",
+      "arvUsed": number, "rehabCost": number, "acquisitionCost": number,
+      "holdingCosts": number, "buyClosing": number, "sellClosing": number,
+      "totalInvested": number, "grossProfit": number, "netProfit": number,
+      "roi": number, "margin": number
+    }
+  ],
+  "dealScore": number,
+  "verdict": "BUY/NEGOTIATE/PASS",
+  "verdictReason": "string",
+  "negotiation": { "openingOffer": number, "maxOffer": number, "walkaway": number, "tactics": "string" },
+  "closerTake": "string — 2-3 sentences, direct dealmaker commentary",
+  "riskFactors": ["string"],
+  "strengths": ["string"]
+}`;
+
+// ─── API CALL HELPER (supports images) ───────────────────────────────────────
+// ─── ROBUST JSON REPAIR ──────────────────────────────────────────────────────
+function repairJSON(str) {
+  let s = str;
+
+  // Strip markdown fences
+  s = s.replace(/```json\s*/g, "").replace(/```\s*/g, "");
+
+  // Extract outermost JSON object
+  const start = s.indexOf("{");
+  if (start === -1) return null;
+
+  // Find matching closing brace by counting depth
+  let depth = 0, end = -1;
+  for (let i = start; i < s.length; i++) {
+    const c = s[i];
+    if (c === "{") depth++;
+    else if (c === "}") { depth--; if (depth === 0) { end = i; break; } }
+    else if (c === '"') {
+      // Skip string content, handling escapes
+      i++;
+      while (i < s.length && s[i] !== '"') { if (s[i] === "\\") i++; i++; }
+    }
+  }
+
+  if (end === -1) {
+    // Truncated JSON — try to close it
+    s = s.substring(start);
+    // Remove any trailing partial string value
+    s = s.replace(/,\s*"[^"]*":\s*"[^"]*$/, "");
+    s = s.replace(/,\s*"[^"]*":\s*$/, "");
+    s = s.replace(/,\s*"[^"]*$/, "");
+    s = s.replace(/,\s*$/, "");
+    // Count unclosed braces and brackets
+    let openBraces = 0, openBrackets = 0;
+    let inStr = false;
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (c === '"' && (i === 0 || s[i-1] !== "\\")) inStr = !inStr;
+      if (!inStr) {
+        if (c === "{") openBraces++;
+        else if (c === "}") openBraces--;
+        else if (c === "[") openBrackets++;
+        else if (c === "]") openBrackets--;
+      }
+    }
+    // Close open brackets then braces
+    for (let i = 0; i < openBrackets; i++) s += "]";
+    for (let i = 0; i < openBraces; i++) s += "}";
+  } else {
+    s = s.substring(start, end + 1);
+  }
+
+  // Common repairs
+  s = s.replace(/,\s*}/g, "}");        // trailing commas before }
+  s = s.replace(/,\s*]/g, "]");        // trailing commas before ]
+  s = s.replace(/'\s*:/g, '":');       // single-quoted keys
+  s = s.replace(/:\s*'/g, ': "');      // single-quoted values
+  s = s.replace(/'\s*,/g, '",');
+  s = s.replace(/'\s*}/g, '"}');
+  s = s.replace(/'\s*]/g, '"]');
+
+  // Remove control characters except newlines and tabs inside strings
+  s = s.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+
+  // Fix common special chars that break JSON strings
+  // Replace literal newlines inside strings
+  s = s.replace(/"([^"]*?)"/g, (match, inner) => {
+    const fixed = inner.replace(/\n/g, "\\n").replace(/\t/g, "\\t").replace(/\r/g, "\\r");
+    return `"${fixed}"`;
+  });
+
+  return s;
+}
+
+// ─── API CALL HELPER (with retry on JSON failure) ────────────────────────────
+async function callAgent(systemPrompt, userMessage, useWebSearch = true, images = [], maxTokens = 4096) {
+  const content = [];
+  for (const img of images) {
+    content.push({ type: "image", source: { type: "base64", media_type: img.mediaType, data: img.data } });
+  }
+  content.push({ type: "text", text: userMessage });
+
+  const body = {
+    model: MODEL,
+    max_tokens: maxTokens,
+    system: systemPrompt,
+    messages: [{ role: "user", content }],
+  };
+  if (useWebSearch) body.tools = [{ type: "web_search_20250305", name: "web_search" }];
+
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`API error ${res.status}: ${err}`);
+  }
+
+  const data = await res.json();
+  const raw = (data.content?.filter(b => b.type === "text") || []).map(b => b.text).join("\n");
+
+  // Attempt 1: direct parse after repair
+  const repaired = repairJSON(raw);
+  if (!repaired) throw new Error("No JSON object found in response");
+
+  try {
+    return JSON.parse(repaired);
+  } catch (e1) {
+    // Attempt 2: ask the model to fix its own broken JSON
+    console.warn("JSON parse failed, attempting auto-repair via API...", e1.message);
+    try {
+      const fixRes = await fetch(API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: MODEL,
+          max_tokens: maxTokens,
+          system: "You are a JSON repair tool. The user will give you broken JSON. Fix it and return ONLY the valid JSON object. Do not add explanation, markdown, or backticks. Do not change any data values — only fix syntax errors (missing commas, unclosed braces/brackets, unescaped quotes, truncated strings). If data appears truncated, close the structure cleanly with reasonable placeholder values.",
+          messages: [{ role: "user", content: `Fix this broken JSON:\n\n${repaired.substring(0, 12000)}` }],
+        }),
+      });
+      if (fixRes.ok) {
+        const fixData = await fixRes.json();
+        const fixRaw = (fixData.content?.filter(b => b.type === "text") || []).map(b => b.text).join("\n");
+        const fixRepaired = repairJSON(fixRaw);
+        if (fixRepaired) {
+          return JSON.parse(fixRepaired);
+        }
+      }
+    } catch (e2) {
+      console.warn("Auto-repair also failed:", e2.message);
+    }
+
+    // Attempt 3: last-ditch — try to extract partial data
+    try {
+      // Try parsing just up to where it breaks
+      const partial = repaired.substring(0, 10000);
+      // Find the last valid closing point
+      for (let i = partial.length; i > 100; i--) {
+        if (partial[i] === "}") {
+          try {
+            const slice = partial.substring(0, i + 1);
+            const result = JSON.parse(repairJSON(slice) || slice);
+            result._partial = true;
+            return result;
+          } catch { /* keep trying */ }
+        }
+      }
+    } catch { /* give up */ }
+
+    throw new Error(`JSON parse failed after all repair attempts. Original error: ${e1.message}`);
+  }
+}
+
+// ─── IMAGE UTILS ─────────────────────────────────────────────────────────────
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const base64 = reader.result.split(",")[1];
+      resolve({ data: base64, mediaType: file.type, name: file.name, size: file.size, preview: reader.result });
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+const ACCEPTED_TYPES = ["image/jpeg", "image/png", "image/webp", "image/gif"];
+const MAX_IMAGES = 12;
+const MAX_SIZE_MB = 5;
+
+// ─── DESIGN TOKENS ──────────────────────────────────────────────────────────
+const T = {
+  bg: "#0B0E13", surface: "#12161E", surfaceAlt: "#181D28", surfaceHover: "#1E2433",
+  border: "rgba(255,255,255,0.06)", borderActive: "rgba(255,255,255,0.12)",
+  text: "#E4E8EF", textMuted: "#6E798A", textDim: "#3E4A5C",
+  green: "#00E676", greenDim: "rgba(0,230,118,0.10)", greenGlow: "rgba(0,230,118,0.25)",
+  amber: "#FFB300", amberDim: "rgba(255,179,0,0.10)",
+  red: "#FF5252", redDim: "rgba(255,82,82,0.10)",
+  blue: "#448AFF", blueDim: "rgba(68,138,255,0.10)",
+  cyan: "#00E5FF", purple: "#B388FF", purpleDim: "rgba(179,136,255,0.10)",
+  mono: "'IBM Plex Mono', 'JetBrains Mono', monospace",
+  sans: "'DM Sans', -apple-system, sans-serif",
+  radius: "8px", radiusLg: "12px",
+};
+
+const fonts = "https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap";
+
+// ─── COMPONENTS ──────────────────────────────────────────────────────────────
+const Card = ({ children, style, glow, ...props }) => (
+  <div style={{ background: T.surface, border: `1px solid ${T.border}`, borderRadius: T.radiusLg, padding: "20px", ...(glow ? { boxShadow: `0 0 20px ${glow}`, borderColor: glow } : {}), ...style }} {...props}>{children}</div>
+);
+
+const Badge = ({ color = "green", children }) => {
+  const c = { green: { bg: T.greenDim, fg: T.green }, amber: { bg: T.amberDim, fg: T.amber }, red: { bg: T.redDim, fg: T.red }, blue: { bg: T.blueDim, fg: T.blue }, purple: { bg: T.purpleDim, fg: T.purple } }[color] || { bg: T.greenDim, fg: T.green };
+  return <span style={{ display: "inline-block", padding: "3px 10px", borderRadius: "4px", fontSize: "10px", fontWeight: 700, letterSpacing: "0.8px", textTransform: "uppercase", background: c.bg, color: c.fg, fontFamily: T.mono }}>{children}</span>;
+};
+
+const Input = ({ label, required, ...props }) => (
+  <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+    <label style={{ fontSize: "10px", fontWeight: 700, letterSpacing: "1px", textTransform: "uppercase", color: T.textMuted, fontFamily: T.mono }}>{label}{required && <span style={{ color: T.red, marginLeft: 3 }}>*</span>}</label>
+    <input style={{ background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radius, padding: "10px 14px", color: T.text, fontSize: "14px", fontFamily: T.sans, outline: "none", transition: "border-color 0.2s" }}
+      onFocus={e => e.target.style.borderColor = T.green} onBlur={e => e.target.style.borderColor = T.border} {...props} />
+  </div>
+);
+
+const Textarea = ({ label, ...props }) => (
+  <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+    <label style={{ fontSize: "10px", fontWeight: 700, letterSpacing: "1px", textTransform: "uppercase", color: T.textMuted, fontFamily: T.mono }}>{label}</label>
+    <textarea style={{ background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radius, padding: "10px 14px", color: T.text, fontSize: "14px", fontFamily: T.sans, outline: "none", resize: "vertical", minHeight: "70px", transition: "border-color 0.2s" }}
+      onFocus={e => e.target.style.borderColor = T.green} onBlur={e => e.target.style.borderColor = T.border} {...props} />
+  </div>
+);
+
+const Select = ({ label, options, ...props }) => (
+  <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+    <label style={{ fontSize: "10px", fontWeight: 700, letterSpacing: "1px", textTransform: "uppercase", color: T.textMuted, fontFamily: T.mono }}>{label}</label>
+    <select style={{ background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radius, padding: "10px 14px", color: T.text, fontSize: "14px", fontFamily: T.sans, outline: "none" }} {...props}>
+      {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+    </select>
+  </div>
+);
+
+const ScoreRing = ({ score, size = 150 }) => {
+  const r = (size - 16) / 2, circ = 2 * Math.PI * r, prog = (score / 100) * circ;
+  const color = score >= 70 ? T.green : score >= 45 ? T.amber : T.red;
+  return (
+    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
+      <circle cx={size/2} cy={size/2} r={r} fill="none" stroke={T.border} strokeWidth="5" />
+      <circle cx={size/2} cy={size/2} r={r} fill="none" stroke={color} strokeWidth="5"
+        strokeDasharray={`${prog} ${circ}`} strokeLinecap="round"
+        transform={`rotate(-90 ${size/2} ${size/2})`} style={{ transition: "stroke-dasharray 1s ease", filter: `drop-shadow(0 0 6px ${color})` }} />
+      <text x={size/2} y={size/2 - 8} textAnchor="middle" fill={color} style={{ fontSize: "34px", fontWeight: 800, fontFamily: T.mono }}>{score}</text>
+      <text x={size/2} y={size/2 + 16} textAnchor="middle" fill={T.textMuted} style={{ fontSize: "9px", fontWeight: 700, letterSpacing: "2px", fontFamily: T.mono }}>DEAL SCORE</text>
+    </svg>
+  );
+};
+
+const StatusDot = ({ status }) => {
+  const c = { Good: T.green, Fair: T.amber, Poor: T.red, Critical: T.red }[status] || T.textMuted;
+  return <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: c, marginRight: 8, boxShadow: `0 0 6px ${c}40` }} />;
+};
+
+const fmt = n => n == null || isNaN(n) ? "—" : "$" + Math.round(n).toLocaleString();
+const pct = n => n == null || isNaN(n) ? "—" : n.toFixed(1) + "%";
+
+const MetricCard = ({ label, value, color }) => (
+  <Card style={{ padding: 14, textAlign: "center" }}>
+    <div style={{ fontSize: "9px", color: T.textMuted, fontFamily: T.mono, letterSpacing: "1px", marginBottom: 6 }}>{label}</div>
+    <div style={{ fontSize: "20px", fontWeight: 800, color: color || T.text, fontFamily: T.mono }}>{value}</div>
+  </Card>
+);
+
+const SectionLabel = ({ color, children }) => (
+  <div style={{ fontSize: "10px", fontWeight: 700, color, fontFamily: T.mono, letterSpacing: "1.5px", marginBottom: 14, textTransform: "uppercase" }}>{children}</div>
+);
+
+// ─── PHOTO UPLOAD COMPONENT ──────────────────────────────────────────────────
+const PhotoUpload = ({ photos, setPhotos }) => {
+  const fileInputRef = useRef(null);
+  const [dragOver, setDragOver] = useState(false);
+
+  const handleFiles = async (files) => {
+    const validFiles = Array.from(files).filter(f => {
+      if (!ACCEPTED_TYPES.includes(f.type)) return false;
+      if (f.size > MAX_SIZE_MB * 1024 * 1024) return false;
+      return true;
+    });
+
+    const remaining = MAX_IMAGES - photos.length;
+    const toProcess = validFiles.slice(0, remaining);
+
+    const newPhotos = await Promise.all(toProcess.map(fileToBase64));
+    setPhotos(prev => [...prev, ...newPhotos]);
+  };
+
+  const handleDrop = (e) => { e.preventDefault(); setDragOver(false); handleFiles(e.dataTransfer.files); };
+  const handleDragOver = (e) => { e.preventDefault(); setDragOver(true); };
+  const handleDragLeave = () => setDragOver(false);
+  const removePhoto = (idx) => setPhotos(prev => prev.filter((_, i) => i !== idx));
+
+  return (
+    <div>
+      {/* Drop zone */}
+      <div
+        onClick={() => fileInputRef.current?.click()}
+        onDrop={handleDrop}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        style={{
+          border: `2px dashed ${dragOver ? T.purple : T.border}`,
+          borderRadius: T.radiusLg,
+          padding: photos.length > 0 ? "14px" : "28px",
+          textAlign: "center",
+          cursor: "pointer",
+          transition: "all 0.2s",
+          background: dragOver ? T.purpleDim : "transparent",
+        }}
+      >
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept={ACCEPTED_TYPES.join(",")}
+          multiple
+          style={{ display: "none" }}
+          onChange={e => handleFiles(e.target.files)}
+        />
+
+        {photos.length === 0 ? (
+          <>
+            <div style={{ fontSize: 28, marginBottom: 8 }}>📸</div>
+            <div style={{ fontSize: "13px", fontWeight: 600, color: T.text, marginBottom: 4 }}>
+              Drop property photos here or click to upload
+            </div>
+            <div style={{ fontSize: "11px", color: T.textMuted, fontFamily: T.mono }}>
+              JPG, PNG, WebP · Up to {MAX_IMAGES} photos · {MAX_SIZE_MB}MB each
+            </div>
+            <div style={{ fontSize: "10px", color: T.purple, fontFamily: T.mono, marginTop: 8, letterSpacing: "0.5px" }}>
+              PHOTOS UNLOCK VISION-BASED CONDITION ASSESSMENT
+            </div>
+          </>
+        ) : (
+          <>
+            {/* Thumbnail grid */}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(80px, 1fr))", gap: 8, marginBottom: photos.length < MAX_IMAGES ? 10 : 0 }}>
+              {photos.map((photo, i) => (
+                <div key={i} style={{ position: "relative", borderRadius: T.radius, overflow: "hidden", aspectRatio: "1", background: T.bg }}>
+                  <img src={photo.preview} alt={photo.name} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                  <button
+                    onClick={(e) => { e.stopPropagation(); removePhoto(i); }}
+                    style={{
+                      position: "absolute", top: 3, right: 3, width: 20, height: 20, borderRadius: "50%",
+                      background: "rgba(0,0,0,0.7)", border: "none", color: "#fff", fontSize: "11px",
+                      cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
+                      lineHeight: 1, padding: 0,
+                    }}
+                  >×</button>
+                  <div style={{
+                    position: "absolute", bottom: 0, left: 0, right: 0, padding: "2px 4px",
+                    background: "rgba(0,0,0,0.6)", fontSize: "8px", color: "#fff", fontFamily: T.mono,
+                    textAlign: "center", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                  }}>{photo.name}</div>
+                </div>
+              ))}
+            </div>
+            {photos.length < MAX_IMAGES && (
+              <div style={{ fontSize: "10px", color: T.textMuted, fontFamily: T.mono }}>
+                {photos.length}/{MAX_IMAGES} photos · Click or drop to add more
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      {/* Photo tips */}
+      {photos.length > 0 && photos.length < 4 && (
+        <div style={{ marginTop: 8, padding: "8px 12px", background: T.purpleDim, borderRadius: T.radius, fontSize: "10px", color: T.purple, fontFamily: T.mono, lineHeight: 1.5 }}>
+          TIP: For best results, include front exterior, kitchen, bathrooms, and any visible damage or systems (HVAC unit, electrical panel, roof).
+        </div>
+      )}
+    </div>
+  );
+};
+
+
+// ─── MAIN APP ─────────────────────────────────────────────────────────────────
+export default function TheCloser() {
+  const [view, setView] = useState("intake");
+  const [currentStep, setCurrentStep] = useState(0);
+  const [stepLogs, setStepLogs] = useState([]);
+  const [stepResults, setStepResults] = useState({});
+  const [error, setError] = useState(null);
+  const [activeTab, setActiveTab] = useState("summary");
+  const [photos, setPhotos] = useState([]);
+
+  const [form, setForm] = useState({
+    address: "", askingPrice: "", beds: "", baths: "", sqft: "", yearBuilt: "",
+    listingUrl: "", notes: "", knownComps: "", finishLevel: "standard", financing: "", maxRehab: "",
+  });
+  const set = key => e => setForm(f => ({ ...f, [key]: e.target.value }));
+
+  const addLog = useCallback((stepIdx, msg) => {
+    setStepLogs(prev => { const next = [...prev]; if (!next[stepIdx]) next[stepIdx] = []; next[stepIdx] = [...next[stepIdx], { time: new Date(), msg }]; return next; });
+  }, []);
+
+  // Prepare images for API calls
+  const getImagePayload = () => photos.map(p => ({ data: p.data, mediaType: p.mediaType }));
+  const hasPhotos = photos.length > 0;
+
+  const runPipeline = async () => {
+    setView("running"); setCurrentStep(0); setStepLogs([]); setStepResults({}); setError(null);
+    const results = {};
+    const images = getImagePayload();
+
+    try {
+      // STEP 1: Property Intel (no photos needed)
+      addLog(0, "Searching property records, tax data, neighborhood context...");
+      const intelMsg = `Evaluate this property:\nAddress: ${form.address}\n${form.beds ? `Beds: ${form.beds}` : ""}\n${form.baths ? `Baths: ${form.baths}` : ""}\n${form.sqft ? `Sqft: ${form.sqft}` : ""}\n${form.yearBuilt ? `Year Built: ${form.yearBuilt}` : ""}\n${form.listingUrl ? `Listing: ${form.listingUrl}` : ""}\n${form.notes ? `Notes: ${form.notes}` : ""}`;
+      results.intel = await callAgent(PROMPT_INTEL, intelMsg, true);
+      addLog(0, `✓ Property data — confidence: ${results.intel?.dataConfidence || "unknown"}`);
+      setStepResults(prev => ({ ...prev, intel: results.intel })); setCurrentStep(1);
+
+      // STEP 2: Comp Analysis (no photos needed)
+      addLog(1, "Searching comparable sales within 1 mile...");
+      results.comps = await callAgent(PROMPT_COMPS(results.intel, form.knownComps || null), `Find comps for ${form.address}. Asking: $${form.askingPrice}.`, true);
+      addLog(1, `✓ ${results.comps?.comps?.length || 0} comps — confidence: ${results.comps?.arvAnalysis?.compConfidence || "?"}/10`);
+      setStepResults(prev => ({ ...prev, comps: results.comps })); setCurrentStep(2);
+
+      // STEP 3: Condition & Risk (WITH PHOTOS)
+      addLog(2, hasPhotos ? `Analyzing ${photos.length} photos + checking FEMA flood zones, Harvey records, soil data...` : "No photos — assessing from data only. Checking FEMA, Harvey, soil...");
+      const condPrompt = PROMPT_CONDITION(results.intel, results.comps, hasPhotos);
+      const condMsg = `Assess condition and risk for ${form.address}, built ${results.intel?.propertyDetails?.yearBuilt || form.yearBuilt || "unknown"}.${hasPhotos ? ` I have attached ${photos.length} property photos for your analysis.` : ""}`;
+      results.condition = await callAgent(condPrompt, condMsg, true, hasPhotos ? images : [], hasPhotos ? 6144 : 4096);
+      addLog(2, `✓ Grade: ${results.condition?.conditionAssessment?.overallGrade || "?"} | Flood: ${results.condition?.floodRisk?.overallRisk || "?"}${hasPhotos ? " | Photos analyzed ✓" : ""}`);
+      setStepResults(prev => ({ ...prev, condition: results.condition })); setCurrentStep(3);
+
+      // STEP 4: Rehab Estimation (WITH PHOTOS for visual verification)
+      addLog(3, `Running Houston pricing engine${hasPhotos ? " with photo-verified scope" : ""}...`);
+      const rehabPrompt = PROMPT_REHAB(results.intel, results.comps, results.condition, form.finishLevel, hasPhotos);
+      const rehabMsg = `Estimate rehab for ${form.address}. Max budget: ${form.maxRehab ? "$" + form.maxRehab : "no cap"}.${hasPhotos ? " Photos attached for visual verification of scope items." : ""}`;
+      results.rehab = await callAgent(rehabPrompt, rehabMsg, false, hasPhotos ? images : [], 8192);
+      addLog(3, `✓ Expected rehab: ${fmt(results.rehab?.scenarios?.expected?.totalExpected)}${results.rehab?.scopeRules?.submarketNote ? ` (${results.rehab.scopeRules.submarketNote})` : ""}`);
+      setStepResults(prev => ({ ...prev, rehab: results.rehab })); setCurrentStep(4);
+
+      // STEP 5: Deal Scoring (no photos needed)
+      addLog(4, "Modeling profit scenarios and computing deal score...");
+      results.financials = await callAgent(PROMPT_FINANCIALS(results.intel, results.comps, results.condition, results.rehab, form.askingPrice, form.financing), `Score this deal. Asking: $${form.askingPrice}. ARV: $${results.comps?.arvAnalysis?.arvExpected}. Rehab: $${results.rehab?.scenarios?.expected?.totalExpected}.`, false, [], 6144);
+      addLog(4, `✓ Deal Score: ${results.financials?.dealScore} — ${results.financials?.verdict}`);
+      setStepResults(prev => ({ ...prev, financials: results.financials }));
+      setView("results");
+    } catch (err) {
+      console.error(err); setError(err.message);
+      if (Object.keys(results).length > 0) {
+        setStepResults(results);
+        addLog(currentStep, `✗ Failed: ${err.message.substring(0, 120)}`);
+      }
+    }
+  };
+
+  // Retry from a failed step
+  const retryFromStep = async () => {
+    setError(null);
+    runPipeline(); // For now, full retry. Could be optimized to resume from failed step.
+  };
+
+  // ── INTAKE ──────────────────────────────────────────────────────────────
+  if (view === "intake") {
+    return (
+      <div style={{ minHeight: "100vh", background: T.bg, color: T.text, fontFamily: T.sans, padding: "24px" }}>
+        <link href={fonts} rel="stylesheet" />
+        <div style={{ maxWidth: 720, margin: "0 auto" }}>
+          <div style={{ marginBottom: 36, display: "flex", alignItems: "center", gap: 14 }}>
+            <div style={{ width: 40, height: 40, borderRadius: 10, background: `linear-gradient(135deg, ${T.green}, ${T.cyan})`, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 800, fontSize: 18, fontFamily: T.mono, color: T.bg }}>$</div>
+            <div>
+              <div style={{ fontSize: 20, fontWeight: 800, letterSpacing: "-0.5px" }}>THE CLOSER</div>
+              <div style={{ fontSize: "10px", color: T.textMuted, fontFamily: T.mono, letterSpacing: "1.5px" }}>MOTAYO INVESTMENTS · AI DEAL EVALUATION · V3</div>
+            </div>
+          </div>
+
+          <Card style={{ marginBottom: 14 }}>
+            <SectionLabel color={T.green}>PROPERTY DETAILS</SectionLabel>
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              <Input label="Property Address" required placeholder="1234 Main St, Houston, TX 77004" value={form.address} onChange={set("address")} />
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+                <Input label="Asking Price" required placeholder="185000" value={form.askingPrice} onChange={set("askingPrice")} />
+                <Input label="Year Built" placeholder="1985" value={form.yearBuilt} onChange={set("yearBuilt")} />
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 14 }}>
+                <Input label="Beds" placeholder="3" value={form.beds} onChange={set("beds")} />
+                <Input label="Baths" placeholder="2" value={form.baths} onChange={set("baths")} />
+                <Input label="Sqft" placeholder="1450" value={form.sqft} onChange={set("sqft")} />
+              </div>
+              <Input label="Listing URL" placeholder="https://har.com/..." value={form.listingUrl} onChange={set("listingUrl")} />
+              <Textarea label="Agent / Wholesaler Notes" placeholder="Motivated seller, foundation repair done 2022, new HVAC..." value={form.notes} onChange={set("notes")} />
+            </div>
+          </Card>
+
+          {/* PHOTO UPLOAD SECTION */}
+          <Card style={{ marginBottom: 14 }}>
+            <SectionLabel color={T.purple}>PROPERTY PHOTOS — VISION ANALYSIS</SectionLabel>
+            <PhotoUpload photos={photos} setPhotos={setPhotos} />
+          </Card>
+
+          <Card style={{ marginBottom: 14 }}>
+            <SectionLabel color={T.amber}>DEAL PARAMETERS</SectionLabel>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+              <Select label="Target Finish Level" options={[{ value: "rental", label: "Rental Grade" }, { value: "standard", label: "Standard Flip" }, { value: "premium", label: "Premium Flip" }]} value={form.finishLevel} onChange={set("finishLevel")} />
+              <Input label="Max Rehab Budget" placeholder="65000 (optional)" value={form.maxRehab} onChange={set("maxRehab")} />
+            </div>
+            <div style={{ marginTop: 14 }}>
+              <Textarea label="Financing Terms" placeholder="Hard money at 10%, 2pts, 90% LTC (or leave blank for defaults)" value={form.financing} onChange={set("financing")} />
+            </div>
+          </Card>
+
+          <Card style={{ marginBottom: 24 }}>
+            <SectionLabel color={T.blue}>KNOWN COMPS (OPTIONAL)</SectionLabel>
+            <Textarea label="Paste comp addresses and sale prices" placeholder={"1240 Oak St — sold $235K, 3/2, 1,500sf, renovated\n1310 Elm Ave — sold $210K, 3/2, 1,380sf, updated"} value={form.knownComps} onChange={set("knownComps")} />
+          </Card>
+
+          <button onClick={runPipeline} disabled={!form.address || !form.askingPrice}
+            style={{
+              width: "100%", padding: "16px", borderRadius: T.radiusLg, border: "none",
+              background: form.address && form.askingPrice ? `linear-gradient(135deg, ${T.green}, ${T.cyan})` : T.surfaceHover,
+              color: form.address && form.askingPrice ? T.bg : T.textDim,
+              fontSize: "15px", fontWeight: 800, fontFamily: T.sans,
+              cursor: form.address && form.askingPrice ? "pointer" : "not-allowed",
+              boxShadow: form.address && form.askingPrice ? `0 4px 24px ${T.greenGlow}` : "none",
+            }}>
+            {hasPhotos ? `Run Full Evaluation with ${photos.length} Photo${photos.length > 1 ? "s" : ""} →` : "Run Full Evaluation →"}
+          </button>
+          <div style={{ textAlign: "center", fontSize: "10px", color: T.textDim, marginTop: 10, fontFamily: T.mono, letterSpacing: "0.5px" }}>
+            5-step pipeline · {hasPhotos ? "vision-enhanced" : "data-only"} · Houston pricing engine v2
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ── RUNNING ─────────────────────────────────────────────────────────────
+  if (view === "running") {
+    return (
+      <div style={{ minHeight: "100vh", background: T.bg, color: T.text, fontFamily: T.sans, padding: "24px" }}>
+        <link href={fonts} rel="stylesheet" />
+        <div style={{ maxWidth: 640, margin: "0 auto" }}>
+          <div style={{ textAlign: "center", marginBottom: 32 }}>
+            <div style={{ fontSize: 18, fontWeight: 800, marginBottom: 4 }}>Evaluating Deal</div>
+            <div style={{ fontSize: 13, color: T.textMuted, fontFamily: T.mono }}>{form.address}</div>
+            <div style={{ display: "flex", gap: 12, justifyContent: "center", marginTop: 6 }}>
+              <span style={{ fontSize: 13, color: T.green, fontFamily: T.mono }}>Asking: ${Number(form.askingPrice).toLocaleString()}</span>
+              {hasPhotos && <Badge color="purple">{photos.length} PHOTOS</Badge>}
+            </div>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            {STEPS.map((step, i) => {
+              const isActive = i === currentStep, isDone = i < currentStep, isPending = i > currentStep;
+              const logs = stepLogs[i] || [];
+              const usesPhotos = (i === 2 || i === 3) && hasPhotos;
+              return (
+                <Card key={step.id} glow={isActive ? T.greenGlow : null} style={{ opacity: isPending ? 0.35 : 1, transition: "all 0.3s" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                    <div style={{
+                      width: 34, height: 34, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14,
+                      background: isDone ? T.greenDim : isActive ? T.greenDim : "transparent",
+                      border: `1.5px solid ${isDone ? T.green : isActive ? T.green + "80" : T.border}`,
+                    }}>{isDone ? "✓" : step.icon}</div>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <span style={{ fontSize: 13, fontWeight: 700, color: isDone ? T.green : isActive ? T.text : T.textDim }}>{step.label}</span>
+                        {usesPhotos && <Badge color="purple">+ PHOTOS</Badge>}
+                      </div>
+                      <div style={{ fontSize: "10px", color: T.textMuted, fontFamily: T.mono }}>{step.desc}</div>
+                    </div>
+                    {isActive && <div style={{ width: 14, height: 14, borderRadius: "50%", border: `2px solid ${T.green}`, borderTopColor: "transparent", animation: "spin 1s linear infinite" }} />}
+                  </div>
+                  {logs.length > 0 && (
+                    <div style={{ marginTop: 10, paddingTop: 10, borderTop: `1px solid ${T.border}` }}>
+                      {logs.map((log, li) => (
+                        <div key={li} style={{ fontSize: "11px", fontFamily: T.mono, color: log.msg.startsWith("✓") ? T.green : T.textMuted, marginTop: li > 0 ? 4 : 0 }}>{log.msg}</div>
+                      ))}
+                    </div>
+                  )}
+                </Card>
+              );
+            })}
+          </div>
+          {error && (
+            <Card style={{ marginTop: 16, borderColor: T.red + "40" }}>
+              <div style={{ fontSize: "11px", fontWeight: 700, color: T.red, fontFamily: T.mono, marginBottom: 8 }}>
+                STEP {currentStep + 1} FAILED
+              </div>
+              <div style={{ fontSize: "11px", color: T.textMuted, fontFamily: T.mono, wordBreak: "break-all", marginBottom: 12 }}>{error}</div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={retryFromStep}
+                  style={{ padding: "8px 16px", borderRadius: T.radius, border: `1px solid ${T.green}40`, background: T.greenDim, color: T.green, fontSize: "11px", fontFamily: T.mono, cursor: "pointer", fontWeight: 700 }}>
+                  ↻ Retry
+                </button>
+                {Object.keys(stepResults).length >= 3 && (
+                  <button onClick={() => { setView("results"); setActiveTab("condition"); }}
+                    style={{ padding: "8px 16px", borderRadius: T.radius, border: `1px solid ${T.amber}40`, background: T.amberDim, color: T.amber, fontSize: "11px", fontFamily: T.mono, cursor: "pointer", fontWeight: 700 }}>
+                    View Partial Results ({Object.keys(stepResults).length}/5 steps)
+                  </button>
+                )}
+                <button onClick={() => setView("intake")}
+                  style={{ padding: "8px 16px", borderRadius: T.radius, border: `1px solid ${T.border}`, background: "transparent", color: T.text, fontSize: "11px", fontFamily: T.mono, cursor: "pointer" }}>
+                  ← Back
+                </button>
+              </div>
+            </Card>
+          )}
+        </div>
+        <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+      </div>
+    );
+  }
+
+  // ── RESULTS ─────────────────────────────────────────────────────────────
+  const { intel, comps, condition, rehab, financials } = stepResults;
+  const score = financials?.dealScore || 0;
+  const verdict = financials?.verdict || "—";
+  const vc = verdict === "BUY" ? "green" : verdict === "NEGOTIATE" ? "amber" : "red";
+  const photoAnalysis = condition?.conditionAssessment?.photoAnalysis;
+
+  const TABS = [
+    { id: "summary", label: "Summary" }, { id: "comps", label: "Comps" },
+    { id: "condition", label: "Condition" }, { id: "risk", label: "Risk" },
+    { id: "rehab", label: "Rehab" }, { id: "profit", label: "Profit" },
+  ];
+
+  const renderSummary = () => (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <Card glow={vc === "green" ? T.greenGlow : null}>
+        <div style={{ display: "flex", alignItems: "center", gap: 24, flexWrap: "wrap" }}>
+          <ScoreRing score={score} />
+          <div style={{ flex: 1, minWidth: 200 }}>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+              <Badge color={vc}>{verdict}</Badge>
+              {hasPhotos && <Badge color="purple">PHOTO-VERIFIED</Badge>}
+            </div>
+            <div style={{ fontSize: 14, color: T.text, marginTop: 10, lineHeight: 1.6 }}>{financials?.verdictReason || "—"}</div>
+            <div style={{ fontSize: 13, color: T.textMuted, marginTop: 12, lineHeight: 1.6, fontStyle: "italic", borderLeft: `2px solid ${T.green}40`, paddingLeft: 12 }}>"{financials?.closerTake || "—"}"</div>
+          </div>
+        </div>
+      </Card>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: 10 }}>
+        <MetricCard label="ASKING" value={fmt(Number(form.askingPrice))} />
+        <MetricCard label="ARV (EXP)" value={fmt(comps?.arvAnalysis?.arvExpected)} color={T.blue} />
+        <MetricCard label="COMP CONF" value={`${comps?.arvAnalysis?.compConfidence || "?"}/10`} color={(comps?.arvAnalysis?.compConfidence||0)>=7?T.green:T.amber} />
+        <MetricCard label="CONDITION" value={condition?.conditionAssessment?.overallGrade || "?"} />
+        <MetricCard label="FLOOD" value={condition?.floodRisk?.overallRisk || "?"} color={condition?.floodRisk?.overallRisk==="LOW"?T.green:condition?.floodRisk?.overallRisk==="MODERATE"?T.amber:T.red} />
+        <MetricCard label="BASE ROI" value={pct(financials?.profitScenarios?.[1]?.roi)} color={(financials?.profitScenarios?.[1]?.roi||0)>20?T.green:T.amber} />
+      </div>
+      {financials?.negotiation && (
+        <Card>
+          <SectionLabel color={T.green}>NEGOTIATION STRATEGY</SectionLabel>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
+            {[{l:"Opening",v:fmt(financials.negotiation.openingOffer)},{l:"Max Offer",v:fmt(financials.negotiation.maxOffer)},{l:"Walk Away",v:fmt(financials.negotiation.walkaway)}].map(n=>(
+              <div key={n.l} style={{textAlign:"center"}}>
+                <div style={{fontSize:"9px",color:T.textMuted,fontFamily:T.mono,letterSpacing:"1px",marginBottom:4}}>{n.l}</div>
+                <div style={{fontSize:20,fontWeight:800,fontFamily:T.mono,color:T.text}}>{n.v}</div>
+              </div>
+            ))}
+          </div>
+          {financials.negotiation.tactics && <div style={{fontSize:"12px",color:T.textMuted,lineHeight:1.6,paddingTop:12,marginTop:12,borderTop:`1px solid ${T.border}`}}>{financials.negotiation.tactics}</div>}
+        </Card>
+      )}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+        <Card><SectionLabel color={T.green}>STRENGTHS</SectionLabel>{(financials?.strengths||[]).map((s,i)=><div key={i} style={{fontSize:"12px",color:T.textMuted,marginTop:6,lineHeight:1.5}}><span style={{color:T.green,marginRight:6}}>+</span>{s}</div>)}</Card>
+        <Card><SectionLabel color={T.red}>RISK FACTORS</SectionLabel>{(financials?.riskFactors||[]).map((r,i)=><div key={i} style={{fontSize:"12px",color:T.textMuted,marginTop:6,lineHeight:1.5}}><span style={{color:T.red,marginRight:6}}>!</span>{r}</div>)}</Card>
+      </div>
+    </div>
+  );
+
+  const renderComps = () => (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <Card>
+        <SectionLabel color={T.blue}>ARV RANGE</SectionLabel>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 12 }}>
+          {[{l:"LOW",v:fmt(comps?.arvAnalysis?.arvLow)},{l:"EXPECTED",v:fmt(comps?.arvAnalysis?.arvExpected)},{l:"HIGH",v:fmt(comps?.arvAnalysis?.arvHigh)},{l:"$/SQFT",v:comps?.arvAnalysis?.medianPricePerSqft?`$${Math.round(comps.arvAnalysis.medianPricePerSqft)}`:"—"}].map(m=>(
+            <div key={m.l} style={{textAlign:"center"}}><div style={{fontSize:"9px",color:T.textMuted,fontFamily:T.mono,letterSpacing:"1px",marginBottom:4}}>{m.l}</div><div style={{fontSize:20,fontWeight:800,fontFamily:T.mono,color:T.text}}>{m.v}</div></div>
+          ))}
+        </div>
+      </Card>
+      <Card style={{ padding: 0, overflow: "hidden" }}>
+        <div style={{ padding: "16px 20px", borderBottom: `1px solid ${T.border}` }}><div style={{fontSize:"10px",fontWeight:700,color:T.blue,fontFamily:T.mono,letterSpacing:"1.5px"}}>COMPARABLE SALES ({(comps?.comps||[]).length})</div></div>
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "11px", fontFamily: T.mono }}>
+            <thead><tr style={{ borderBottom: `1px solid ${T.border}` }}>
+              {["Address","Price","$/sf","Bd/Ba","Sqft","Condition","Dist","Score"].map(h=><th key={h} style={{padding:"10px 12px",textAlign:"left",color:T.textMuted,fontWeight:700,fontSize:"9px",letterSpacing:"1px"}}>{h}</th>)}
+            </tr></thead>
+            <tbody>{(comps?.comps||[]).map((c,i)=>(
+              <tr key={i} style={{borderBottom:`1px solid ${T.border}`}}>
+                <td style={{padding:"10px 12px",color:T.text,maxWidth:170,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{c.address}</td>
+                <td style={{padding:"10px 12px",color:T.green}}>{fmt(c.salePrice)}</td>
+                <td style={{padding:"10px 12px",color:T.textMuted}}>${Math.round(c.pricePerSqft||0)}</td>
+                <td style={{padding:"10px 12px",color:T.textMuted}}>{c.beds}/{c.baths}</td>
+                <td style={{padding:"10px 12px",color:T.textMuted}}>{c.sqft?.toLocaleString()}</td>
+                <td style={{padding:"10px 12px"}}><Badge color={c.condition==="renovated"?"green":c.condition==="updated"?"blue":c.condition==="distressed"?"red":"amber"}>{c.condition}</Badge></td>
+                <td style={{padding:"10px 12px",color:T.textMuted}}>{c.distanceMiles}mi</td>
+                <td style={{padding:"10px 12px",color:(c.relevanceScore||0)>=7?T.green:T.amber}}>{c.relevanceScore}/10</td>
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>
+      </Card>
+    </div>
+  );
+
+  const renderCondition = () => (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      {/* Photo analysis summary */}
+      {photoAnalysis && (
+        <Card glow={T.purpleDim}>
+          <SectionLabel color={T.purple}>PHOTO ANALYSIS</SectionLabel>
+          <div style={{ fontSize: "12px", color: T.text, lineHeight: 1.6, marginBottom: 10 }}>{photoAnalysis.overallImpressions}</div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
+            <Badge color="purple">{photoAnalysis.photosReviewed} photos reviewed</Badge>
+            <Badge color={photoAnalysis.photoVsAge === "better-than-expected" ? "green" : photoAnalysis.photoVsAge === "worse-than-expected" ? "red" : "amber"}>
+              {photoAnalysis.photoVsAge}
+            </Badge>
+          </div>
+          {(photoAnalysis.keyFindings || []).length > 0 && (
+            <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 10 }}>
+              {photoAnalysis.keyFindings.map((f, i) => (
+                <div key={i} style={{ fontSize: "11px", color: T.textMuted, marginTop: 4, lineHeight: 1.5 }}>
+                  <span style={{ color: T.purple, marginRight: 6 }}>📸</span>{f}
+                </div>
+              ))}
+            </div>
+          )}
+        </Card>
+      )}
+      <Card>
+        <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 16 }}>
+          <div style={{ fontSize: 44, fontWeight: 800, fontFamily: T.mono, color: T.text }}>{condition?.conditionAssessment?.overallGrade || "?"}</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <Badge color={["A","B"].includes(condition?.conditionAssessment?.overallGrade)?"green":condition?.conditionAssessment?.overallGrade==="C"?"amber":"red"}>{condition?.conditionAssessment?.classification || "Unknown"}</Badge>
+            <div style={{ fontSize: "10px", color: T.textMuted, fontFamily: T.mono }}>{condition?.conditionAssessment?.confidenceLevel || ""}</div>
+          </div>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {(condition?.conditionAssessment?.systems || []).map((sys, i) => (
+            <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 10, padding: "10px 12px", background: T.bg, borderRadius: T.radius, flexWrap: "wrap" }}>
+              <StatusDot status={sys.status} />
+              <div style={{ width: 85, fontSize: "11px", fontWeight: 700, fontFamily: T.mono, color: T.text, flexShrink: 0 }}>{sys.name}</div>
+              <Badge color={sys.status==="Good"?"green":sys.status==="Fair"?"amber":"red"}>{sys.status}</Badge>
+              <div style={{ flex: 1, minWidth: 120 }}>
+                <div style={{ fontSize: "11px", color: T.textMuted }}>{sys.notes}</div>
+                {sys.photoEvidence && <div style={{ fontSize: "10px", color: T.purple, marginTop: 3, fontFamily: T.mono }}>📸 {sys.photoEvidence}</div>}
+              </div>
+              {sys.houstonFlag && <div style={{ fontSize: "10px", color: T.amber, fontFamily: T.mono }}>⚠ {sys.houstonFlag}</div>}
+            </div>
+          ))}
+        </div>
+      </Card>
+      {(condition?.dealKillers||[]).length > 0 && (
+        <Card style={{ borderColor: T.red+"40" }}>
+          <SectionLabel color={T.red}>⚠ DEAL KILLERS</SectionLabel>
+          {condition.dealKillers.map((dk, i) => <div key={i} style={{ fontSize: "12px", color: T.text, marginTop: 6, lineHeight: 1.5 }}>• {dk}</div>)}
+        </Card>
+      )}
+    </div>
+  );
+
+  const renderRisk = () => (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <Card>
+        <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 16 }}>
+          <span style={{ fontSize: 14, fontWeight: 800, fontFamily: T.mono }}>FLOOD RISK:</span>
+          <Badge color={condition?.floodRisk?.overallRisk==="LOW"?"green":condition?.floodRisk?.overallRisk==="MODERATE"?"amber":"red"}>{condition?.floodRisk?.overallRisk || "UNKNOWN"}</Badge>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 16 }}>
+          {[{l:"FEMA ZONE",v:condition?.floodRisk?.femaZone||"—"},{l:"HARVEY",v:condition?.floodRisk?.harveyImpact||"—"},{l:"INS. EST.",v:condition?.floodRisk?.insuranceEstimate?fmt(condition.floodRisk.insuranceEstimate)+"/yr":"—"}].map(m=>(
+            <div key={m.l} style={{textAlign:"center",padding:12,background:T.bg,borderRadius:T.radius}}>
+              <div style={{fontSize:"9px",color:T.textMuted,fontFamily:T.mono,letterSpacing:"1px",marginBottom:4}}>{m.l}</div>
+              <div style={{fontSize:14,fontWeight:700,fontFamily:T.mono,color:T.text,textTransform:"capitalize"}}>{m.v}</div>
+            </div>
+          ))}
+        </div>
+        {(condition?.floodRisk?.factors||[]).map((f,i)=>(
+          <div key={i} style={{display:"flex",alignItems:"center",gap:12,padding:"10px 12px",background:T.bg,borderRadius:T.radius,marginTop:8}}>
+            <Badge color={f.risk==="LOW"?"green":f.risk==="MODERATE"?"amber":"red"}>{f.risk}</Badge>
+            <div style={{flex:1}}><div style={{fontSize:"12px",fontWeight:700,color:T.text}}>{f.factor}</div><div style={{fontSize:"11px",color:T.textMuted}}>{f.details}</div></div>
+          </div>
+        ))}
+      </Card>
+    </div>
+  );
+
+  const renderRehab = () => (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      {rehab?.scopeRules && (
+        <Card style={{ padding: 14 }}>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
+            {rehab.scopeRules.submarketNote && <Badge color="blue">{rehab.scopeRules.submarketNote}</Badge>}
+            {hasPhotos && rehab.scopeRules.photoImpact && <Badge color="purple">PHOTO-ADJUSTED</Badge>}
+            {(rehab.scopeRules.mandatoryItems||[]).map((m,i)=><Badge key={i} color="red">MUST: {m}</Badge>)}
+          </div>
+          {hasPhotos && rehab.scopeRules.photoImpact && typeof rehab.scopeRules.photoImpact === "string" && (
+            <div style={{ fontSize: "11px", color: T.purple, fontFamily: T.mono, marginTop: 8 }}>📸 {rehab.scopeRules.photoImpact}</div>
+          )}
+        </Card>
+      )}
+      {(rehab?.budgetWarnings||[]).length > 0 && (
+        <Card style={{ borderColor: T.amber+"40", padding: 14 }}>
+          {rehab.budgetWarnings.map((w,i) => <div key={i} style={{ fontSize: "11px", color: T.amber, fontFamily: T.mono }}>⚠ {w}</div>)}
+        </Card>
+      )}
+      {["conservative","expected","aggressive"].map(tier => {
+        const s = rehab?.scenarios?.[tier]; if (!s) return null;
+        const tc = tier==="conservative"?T.green:tier==="expected"?T.amber:T.red;
+        return (
+          <Card key={tier}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+              <div>
+                <Badge color={tier==="conservative"?"green":tier==="expected"?"amber":"red"}>{s.label || tier}</Badge>
+                <div style={{ fontSize: "11px", color: T.textMuted, marginTop: 6, maxWidth: 400 }}>{s.scope}</div>
+              </div>
+              <div style={{ textAlign: "right" }}>
+                <div style={{ fontSize: 24, fontWeight: 800, fontFamily: T.mono, color: tc }}>{fmt(s.totalExpected)}</div>
+                <div style={{ fontSize: "10px", color: T.textMuted, fontFamily: T.mono }}>{s.timelineWeeks}wk{s.contingencyPercent?` · ${s.contingencyPercent}% contingency`:""}</div>
+              </div>
+            </div>
+            <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 12 }}>
+              {(s.lineItems||[]).map((item, i) => (
+                <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", padding: "7px 0", borderBottom: i<s.lineItems.length-1?`1px solid ${T.border}`:"none", gap: 8 }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                      <span style={{ fontSize: "12px", color: T.text, fontWeight: 600 }}>{item.item}</span>
+                      {item.mandatory && <span style={{ fontSize: "8px", fontWeight: 800, color: T.red, background: T.redDim, padding: "1px 5px", borderRadius: 3, fontFamily: T.mono }}>REQ</span>}
+                      {item.category && <span style={{ fontSize: "8px", color: T.textDim, fontFamily: T.mono, textTransform: "uppercase" }}>{item.category}</span>}
+                    </div>
+                    {item.calculation && <div style={{ fontSize: "10px", color: T.textDim, fontFamily: T.mono, marginTop: 2 }}>{item.calculation}</div>}
+                  </div>
+                  <div style={{ fontSize: "12px", fontFamily: T.mono, color: T.textMuted, whiteSpace: "nowrap" }}>{fmt(item.expected)}</div>
+                </div>
+              ))}
+              {s.contingencyAmount > 0 && (
+                <div style={{ display: "flex", justifyContent: "space-between", padding: "7px 0", marginTop: 4, borderTop: `1px dashed ${T.border}` }}>
+                  <span style={{ fontSize: "12px", color: T.amber, fontWeight: 600 }}>Contingency ({s.contingencyPercent}%)</span>
+                  <span style={{ fontSize: "12px", fontFamily: T.mono, color: T.amber }}>{fmt(s.contingencyAmount)}</span>
+                </div>
+              )}
+            </div>
+          </Card>
+        );
+      })}
+      {(rehab?.criticalItems||[]).length > 0 && (
+        <Card style={{ borderColor: T.amber+"40" }}>
+          <SectionLabel color={T.amber}>CRITICAL — MUST ADDRESS</SectionLabel>
+          {rehab.criticalItems.map((c,i)=><div key={i} style={{fontSize:"12px",color:T.text,marginTop:6}}>• {c}</div>)}
+        </Card>
+      )}
+    </div>
+  );
+
+  const renderProfit = () => (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      {(financials?.profitScenarios||[]).map((s,i)=>{
+        const pos=(s.netProfit||0)>0;
+        return(
+          <Card key={i} glow={i===1?(pos?T.greenGlow:null):null}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+              <Badge color={i===0?"green":i===1?"amber":"red"}>{s.name}</Badge>
+              <div style={{fontSize:24,fontWeight:800,fontFamily:T.mono,color:pos?T.green:T.red}}>{fmt(s.netProfit)}</div>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:8,fontSize:"11px",fontFamily:T.mono}}>
+              {[{l:"ARV",v:fmt(s.arvUsed)},{l:"ALL-IN",v:fmt(s.totalInvested)},{l:"ROI",v:pct(s.roi)},{l:"MARGIN",v:pct(s.margin)}].map(m=>(
+                <div key={m.l} style={{textAlign:"center",padding:8,background:T.bg,borderRadius:T.radius}}>
+                  <div style={{color:T.textMuted,fontSize:"8px",letterSpacing:"1px",marginBottom:3}}>{m.l}</div>
+                  <div style={{color:T.text,fontWeight:700}}>{m.v}</div>
+                </div>
+              ))}
+            </div>
+            <div style={{marginTop:12,paddingTop:12,borderTop:`1px solid ${T.border}`,display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,fontSize:"11px"}}>
+              {[{l:"Acquisition",v:fmt(s.acquisitionCost)},{l:"Rehab",v:fmt(s.rehabCost)},{l:"Holding (5mo)",v:fmt(s.holdingCosts)},{l:"Buy Closing",v:fmt(s.buyClosing)},{l:"Sell Closing",v:fmt(s.sellClosing)},{l:"Gross Profit",v:fmt(s.grossProfit)}].map(m=>(
+                <div key={m.l} style={{display:"flex",justifyContent:"space-between",color:T.textMuted,fontFamily:T.mono}}>
+                  <span>{m.l}</span><span style={{color:T.text}}>{m.v}</span>
+                </div>
+              ))}
+            </div>
+          </Card>
+        );
+      })}
+    </div>
+  );
+
+  const tabContent = { summary: renderSummary, comps: renderComps, condition: renderCondition, risk: renderRisk, rehab: renderRehab, profit: renderProfit };
+
+  return (
+    <div style={{ minHeight: "100vh", background: T.bg, color: T.text, fontFamily: T.sans, padding: "24px" }}>
+      <link href={fonts} rel="stylesheet" />
+      <div style={{ maxWidth: 840, margin: "0 auto" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+          <div>
+            <div style={{ fontSize: 15, fontWeight: 800 }}>{form.address}</div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 4 }}>
+              <span style={{ fontSize: "10px", color: T.textMuted, fontFamily: T.mono, letterSpacing: "0.5px" }}>
+                {new Date().toLocaleDateString()} · {fmt(Number(form.askingPrice))}
+              </span>
+              {hasPhotos && <Badge color="purple">{photos.length} photos</Badge>}
+            </div>
+          </div>
+          <button onClick={() => { setView("intake"); setActiveTab("summary"); }}
+            style={{ padding: "8px 16px", borderRadius: T.radius, border: `1px solid ${T.border}`, background: "transparent", color: T.text, fontSize: "11px", fontFamily: T.mono, cursor: "pointer" }}>
+            New Eval
+          </button>
+        </div>
+        <div style={{ display: "flex", gap: 2, marginBottom: 20, background: T.surface, borderRadius: T.radius, padding: 3, border: `1px solid ${T.border}` }}>
+          {TABS.map(tab => (
+            <button key={tab.id} onClick={() => setActiveTab(tab.id)}
+              style={{
+                flex: 1, padding: "10px 6px", borderRadius: 6, border: "none",
+                background: activeTab===tab.id?T.surfaceHover:"transparent",
+                color: activeTab===tab.id?T.text:T.textMuted,
+                fontSize: "11px", fontWeight: 700, fontFamily: T.mono, cursor: "pointer",
+                transition: "all 0.2s",
+                ...(activeTab===tab.id?{boxShadow:"0 1px 8px rgba(0,0,0,0.3)"}:{}),
+              }}>
+              {tab.label}
+            </button>
+          ))}
+        </div>
+        {tabContent[activeTab]?.()}
+      </div>
+    </div>
+  );
+}
